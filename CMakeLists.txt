@@ -6,7 +6,7 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 
 set(PROJECT_SOURCES 
-    main.cpp
+    main.cu
     src/test.cu
 )
 
