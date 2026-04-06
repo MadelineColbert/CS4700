@@ -42,7 +42,7 @@ void define_nn(NN* network);
 
 void free_nn(NN* nn);
 
-void load_data(int in, float* d_images, float* d_labels);
+void load_data(int in, float** d_images, float** d_labels);
 void free_input(float* d_images, float* d_labels);
 
 
