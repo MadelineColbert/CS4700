@@ -46,7 +46,6 @@ void load_data(int in, float* d_images, float* d_labels);
 void free_input(float* d_images, float* d_labels);
 
 
-float* forward_pass(NN* nn, float* input);
 
 void init_nn(NN* network);
 
