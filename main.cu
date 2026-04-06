@@ -3,7 +3,7 @@
 
 int main() {
   NN network;
-  int network.layers = {784,100,10};
+  network.layers = {784,100,10};
   float *d_images, *d_labels;
   load_data(784, &d_images, &d_labels);
 
