@@ -13,7 +13,7 @@ void define_nn(NN* network){
 }
 
 void init_nn(NN* network) {
-    for (int l = 0; l < NUM_LAYERS l++) {
+    for (int l = 0; l < NUM_LAYERS; l++) {
         int in_dim  = network->layers[l];
         int out_dim = network->layers[l + 1];
         
