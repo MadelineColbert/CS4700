@@ -35,7 +35,7 @@ typedef struct{
     float* bias[NUM_LAYERS];
     float *pre_act[NUM_LAYERS];
     float *post_act[NUM_LAYERS];
-    int layers[NUM_LAYERS];
+    int layers[NUM_LAYERS+1];
 } NN;
 
 void define_nn(NN* network);
