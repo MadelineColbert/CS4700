@@ -37,9 +37,9 @@ void free_nn(NN* network){
     }
 }
 
-void load_data(int in, float* d_images, float* d_labels){
-    cudaMalloc(&d_images, BATCH_SIZE * in * sizeof(float));
-    cudaMalloc(&d_labels, BATCH_SIZE            * sizeof(float));
+void load_data(int in, float** d_images, float** d_labels){
+    cudaMalloc(d_images, BATCH_SIZE * in * sizeof(float));
+    cudaMalloc(d_labels, BATCH_SIZE            * sizeof(float));
  
     // Read from disk into a host buffer, then copy to device
     float *h_images = (float*)malloc(BATCH_SIZE * in * sizeof(float));
@@ -51,8 +51,8 @@ void load_data(int in, float* d_images, float* d_labels){
     f = fopen("mnist_data/test_labels.bin", "rb");
     fread(h_labels, sizeof(float), BATCH_SIZE,            f); fclose(f);
  
-    cudaMemcpy(d_images, h_images, BATCH_SIZE * in * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_labels, h_labels, BATCH_SIZE            * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_images, h_images, BATCH_SIZE * in * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_labels, h_labels, BATCH_SIZE            * sizeof(float), cudaMemcpyHostToDevice);
     free(h_images);
     free(h_labels);
 }
