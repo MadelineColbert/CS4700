@@ -150,7 +150,7 @@ int mnist_bin_to_int(char *v){
 
 // Inspiration on how to load (especially the magic numbers)
 // Was taken from https://github.com/projectgalateia/mnist/blob/master/mnist.h
-void load_mnist(char* image_file, char* label_file, float*** images, int** labels, int* count){
+void load_mnist(char* image_file, char* label_file, float** images, int** labels, int* count){
     FILE *ifp = fopen(image_file, "rb");
     FILE *lfp = fopen(label_file, "rb");
     char tmp[4];
@@ -178,25 +178,21 @@ void load_mnist(char* image_file, char* label_file, float*** images, int** label
     int dim_2 = mnist_bin_to_int(tmp);
 
     *count = image_cnt;
-    *images = (float**)malloc(sizeof(float*)*image_cnt);
+    *images = (float*)malloc(sizeof(float)*image_cnt*28*28);
     *labels = (int*)malloc(sizeof(int)*image_cnt);
 
     for (int i=0; i< image_cnt; i++) {
         unsigned char read_data[28*28];
-        (*images)[i] = (float *)malloc(sizeof(float)*28*28);
         fread(read_data, 1, 28*28, ifp);
         for (int j=0; j < 28*28; j++){
-            (*images)[i][j] = read_data[j] / 255.0f;
+            (*images)[i*28*28 + j] = read_data[j] / 255.0f;
         }
         fread(tmp, 1, 1, lfp);
         (*labels)[i] = (int)tmp[0];
     }
 }
 
-void free_input(float** images, int* labels, int count){
-    for (int i=0; i<count; i++){
-        free(images[i]);
-    }
+void free_input(float* images, int* labels, int count){
     free(images);
     free(labels);
 }
@@ -208,7 +204,7 @@ int main() {
   network.layers[1] = 100;
   network.layers[2] = 10;
 
-  float** images = NULL;
+  float* images = NULL;
   int* labels=NULL;
   int count=0;
 
@@ -227,7 +223,7 @@ int main() {
     printf("HANDLE CREATION");
   }
 
-//   forward(&network, in, handle);
+//   forward(&network, images, handle);
 
   free_nn(&network);
 
