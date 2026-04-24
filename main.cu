@@ -148,6 +148,8 @@ int mnist_bin_to_int(char *v){
     return ret;
 }
 
+// Inspiration on how to load (especially the magic numbers)
+// Was taken from https://github.com/projectgalateia/mnist/blob/master/mnist.h
 void load_mnist(char* image_file, char* label_file, float*** images, int** labels, int* count){
     FILE *ifp = fopen(image_file, "rb");
     FILE *lfp = fopen(label_file, "rb");
@@ -215,7 +217,6 @@ int main() {
   printf("Number of Images: %d\n", count);
   printf("First Label: %d\n", labels[0]);
 
-  
   define_nn(&network);
 
   init_nn(&network);
