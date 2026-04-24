@@ -102,10 +102,9 @@ void free_nn(NN* network){
     }
 }
 
-void forward(NN* network, float* input){
-    cublasHandle_t handle;
+void forward(NN* network, float* input, cublasHandle_t handle){
     float one = 1.0f;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    float zero= 0.0f;
     float* in;
     for (int l=0; l<NUM_LAYERS; l++) {
         if (l == 0){
@@ -116,7 +115,7 @@ void forward(NN* network, float* input){
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
                         network->layers[l+1], BATCH_SIZE, network->layers[l], 
                         &one, network->weights[l], network->layers[l+1], 
-                        in, network->layers[l], &one, 
+                        in, network->layers[l], &zero, 
                         network->pre_act[l], network->layers[l+1]));
         dim3 blockDim(16,16);
         dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x, 
@@ -139,22 +138,98 @@ void test_input(float* in) {
                               cudaMemcpyHostToDevice));
 }
 
+int mnist_bin_to_int(char *v){
+    int i;
+    int ret = 0;
+    for (i=0; i<4;i++){
+        ret <<=8;
+        ret |= (unsigned char)v[i];
+    }
+    return ret;
+}
+
+void load_mnist(char* image_file, char* label_file, float*** images, int** labels, int* count){
+    FILE *ifp = fopen(image_file, "rb");
+    FILE *lfp = fopen(label_file, "rb");
+    char tmp[4];
+    
+    fread(tmp, 1, 4, ifp);
+    if (mnist_bin_to_int(tmp) != 2051){
+        printf("Error");
+    }
+
+    fread(tmp, 1, 4, lfp);
+    if (mnist_bin_to_int(tmp) != 2049){
+        printf("Error");
+    }
+
+    fread(tmp, 1, 4, ifp);
+    int image_cnt = mnist_bin_to_int(tmp);
+    
+    fread(tmp, 1, 4, lfp);
+    int label_cnt = mnist_bin_to_int(tmp);
+
+    fread(tmp, 1, 4, ifp);
+    int dim_1 = mnist_bin_to_int(tmp);
+
+    fread(tmp, 1, 4, ifp);
+    int dim_2 = mnist_bin_to_int(tmp);
+
+    *count = image_cnt;
+    *images = (float**)malloc(sizeof(float*)*image_cnt);
+    *labels = (int*)malloc(sizeof(int)*image_cnt);
+
+    for (int i=0; i< image_cnt; i++) {
+        unsigned char read_data[28*28];
+        (*images)[i] = (float *)malloc(sizeof(float)*28*28);
+        fread(read_data, 1, 28*28, ifp);
+        for (int j=0; j < 28*28; j++){
+            (*images)[i][j] = read_data[j] / 255.0f;
+        }
+        fread(tmp, 1, 1, lfp);
+        (*labels)[i] = (int)tmp[0];
+    }
+}
+
+void free_input(float** images, int* labels, int count){
+    for (int i=0; i<count; i++){
+        free(images[i]);
+    }
+    free(images);
+    free(labels);
+}
+
 int main() {
   NN network;
+  cublasHandle_t handle;
   network.layers[0] = 784;
   network.layers[1] = 100;
   network.layers[2] = 10;
+
+  float** images = NULL;
+  int* labels=NULL;
+  int count=0;
+
+  load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
+
+  printf("Number of Images: %d\n", count);
+  printf("First Label: %d\n", labels[0]);
+
   
-  float* in;
-
-  test_input(in);
-
   define_nn(&network);
 
   init_nn(&network);
 
-  forward(&network, in);
+  cublasStatus_t state = cublasCreate(&handle);
+
+  if (state != CUBLAS_STATUS_SUCCESS){
+    printf("HANDLE CREATION");
+  }
+
+//   forward(&network, in, handle);
 
   free_nn(&network);
+
+  free_input(images, labels, count);
   return 0;
 }
