@@ -65,7 +65,7 @@ __global__ void relu_kernel(float* pre_act,
     }
 }
 
-// 
+//
 __global__ void softmax_kernel(float* in, float* out, int length, int batch_size){
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= batch_size) return;
@@ -101,20 +101,17 @@ void init_nn(NN* network) {
     for (int l = 0; l < NUM_LAYERS; l++) {
         int in_dim  = network->layers[l];
         int out_dim = network->layers[l + 1];
-        
+
         float* h_W = (float*)calloc(in_dim * out_dim, sizeof(float));
         float* h_b = (float*)calloc(out_dim, sizeof(float));
         for (int i=0; i<in_dim*out_dim; i++){
           h_W[i] = 1;
-          if (i%in_dim == 0){
-            h_b[i] = 1;
-          }
         }
         CUDA_CHECK(cudaMemcpy(network->weights[l], h_W, in_dim * out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(network->bias[l], h_b, out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
-        free(h_W); 
+        free(h_W);
         free(h_b);
     }
 }
@@ -150,17 +147,17 @@ void forward(NN* network, float* input, cublasHandle_t handle){
         } else{
             in = network->post_act[l-1];
         }
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
-                        network->layers[l+1], BATCH_SIZE, network->layers[l], 
-                        &one, network->weights[l], network->layers[l+1], 
-                        in, network->layers[l], &zero, 
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                        network->layers[l+1], BATCH_SIZE, network->layers[l],
+                        &one, network->weights[l], network->layers[l+1],
+                        in, network->layers[l], &zero,
                         network->pre_act[l], network->layers[l+1]));
         dim3 blockDim(16,16);
-        dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x, 
+        dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x,
                   (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
 
         add_bias<<<gridDim, blockDim>>>(network->pre_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
-        
+
         if (l == NUM_LAYERS-1){
             softmax_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
         } else {
@@ -173,11 +170,11 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
     float one = 1.0f;
     float zero= 0.0f;
     // Start by initializing with cross entropy loss
-    
+
 
     // Average it, so gradient / BATCH_SIZE
     for (int l=NUM_LAYERS-1; l>=0; l--){
-        
+
     }
 }
 
@@ -197,7 +194,7 @@ void load_mnist(char* image_file, char* label_file, float** images, int** labels
     FILE *ifp = fopen(image_file, "rb");
     FILE *lfp = fopen(label_file, "rb");
     char tmp[4];
-    
+
     fread(tmp, 1, 4, ifp);
     if (mnist_bin_to_int(tmp) != 2051){
         printf("Error");
@@ -210,7 +207,7 @@ void load_mnist(char* image_file, char* label_file, float** images, int** labels
 
     fread(tmp, 1, 4, ifp);
     int image_cnt = mnist_bin_to_int(tmp);
-    
+
     fread(tmp, 1, 4, lfp);
     int label_cnt = mnist_bin_to_int(tmp);
 
@@ -277,12 +274,12 @@ int main() {
 
   for (int iter=0; iter < EPOCHS; iter++){
     for (int batch=0; batch < batches_per_epoch; batch++){
-        // Since the batches per epoch is just integer division, we remove the remaining images. 
+        // Since the batches per epoch is just integer division, we remove the remaining images.
         int offset = batch * BATCH_SIZE;
-        
-        // Add starting address so that 
-        cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_images, &images[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
+
+        // Add starting address so that
+        cudaMemcpy(&d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(&d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
         forward(&network, d_images, handle);
 
@@ -293,7 +290,7 @@ int main() {
 
   cudaMemcpy(&prob, &network.post_act[NUM_LAYERS-1][0], sizeof(float), cudaMemcpyDeviceToHost);
 
-  printf("Test probability %d", prob);
+  printf("Test probability %f", prob);
 
 
   free_nn(&network);
