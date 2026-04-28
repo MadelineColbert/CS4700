@@ -5,6 +5,19 @@
 #include "cuda_runtime.h"
 #include "cublas_v2.h"
 
+/*
+TODO:
+- Implement better softmax kernel
+- Update the NN struct to allow for gradients
+- Implement backpropagation using cross-entropy loss
+    - Biases
+    - Weights
+    - Handling activation functions (ReLU and Softmax)
+- Add loss tracking over epochs
+- Add sparsity measure
+*/
+
+
 #define CUDA_CHECK(call)                                                  \
     do {                                                                  \
         cudaError_t _e = (call);                                          \
@@ -27,7 +40,9 @@
 
 #define NUM_LAYERS 2
 
-#define BATCH_SIZE 10000
+#define BATCH_SIZE 256
+#define STEP_SIZE 0.01
+#define EPOCHS 1
 
 typedef struct{
     float* weights[NUM_LAYERS];
@@ -48,6 +63,29 @@ __global__ void relu_kernel(float* pre_act,
         int index = col*out_dim+row;
         post_act[index] = fmaxf(0.0f, pre_act[index]);
     }
+}
+
+// 
+__global__ void softmax_kernel(float* in, float* out, int length, int batch_size){
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= batch_size) return;
+
+    const float* src = in + col * length;
+    float*       dst = in  + col * length;
+
+    /* 1. find max for numerical stability */
+    float mx = src[0];
+    for (int i = 1; i < length; i++) mx = fmaxf(mx, src[i]);
+
+    /* 2. exponentiate and sum */
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) {
+        dst[i] = expf(src[i] - mx);
+        sum   += dst[i];
+    }
+
+    /* 3. normalise */
+    for (int i = 0; i < length; i++) dst[i] /= sum;
 }
 
 __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
@@ -122,20 +160,25 @@ void forward(NN* network, float* input, cublasHandle_t handle){
                   (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
 
         add_bias<<<gridDim, blockDim>>>(network->pre_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
-
-        relu_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l],network->layers[l+1], BATCH_SIZE);
+        
+        if (l == NUM_LAYERS-1){
+            softmax_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
+        } else {
+            relu_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l],network->layers[l+1], BATCH_SIZE);
+        }
     }
 }
 
+void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
+    float one = 1.0f;
+    float zero= 0.0f;
+    // Start by initializing with cross entropy loss
+    
 
-void test_input(float* in) {
-  float* d_in = (float*)malloc(784*2*sizeof(float));
-  for (int i =0; i<784*2; i++){
-    d_in[i] = 1;
-  }
-  CUDA_CHECK(cudaMalloc(&in, 784*2*sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(in, d_in, 784 * 2 * sizeof(float),
-                              cudaMemcpyHostToDevice));
+    // Average it, so gradient / BATCH_SIZE
+    for (int l=NUM_LAYERS-1; l>=0; l--){
+        
+    }
 }
 
 int mnist_bin_to_int(char *v){
@@ -190,6 +233,9 @@ void load_mnist(char* image_file, char* label_file, float** images, int** labels
         fread(tmp, 1, 1, lfp);
         (*labels)[i] = (int)tmp[0];
     }
+
+    fclose(ifp);
+    fclose(lfp);
 }
 
 void free_input(float* images, int* labels, int count){
@@ -210,12 +256,16 @@ int main() {
 
   load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 
-  printf("Number of Images: %d\n", count);
-  printf("First Label: %d\n", labels[0]);
-
   define_nn(&network);
 
   init_nn(&network);
+
+  float* d_images;
+  CUDA_CHECK(cudaMalloc(&d_images, 28*28 * BATCH_SIZE * sizeof(float)));
+
+  int* d_labels;
+  CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
+
 
   cublasStatus_t state = cublasCreate(&handle);
 
@@ -223,9 +273,32 @@ int main() {
     printf("HANDLE CREATION");
   }
 
-//   forward(&network, images, handle);
+  int batches_per_epoch = count/EPOCHS;
+
+  for (int iter=0; iter < EPOCHS; iter++){
+    for (int batch=0; batch < batches_per_epoch; batch++){
+        // Since the batches per epoch is just integer division, we remove the remaining images. 
+        int offset = batch * BATCH_SIZE;
+        
+        // Add starting address so that 
+        cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_images, &images[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
+
+        forward(&network, d_images, handle);
+
+    }
+  }
+
+  float prob;
+
+  cudaMemcpy(&prob, &network.post_act[NUM_LAYERS-1][0], sizeof(float), cudaMemcpyDeviceToHost);
+
+  printf("Test probability %d", prob);
+
 
   free_nn(&network);
+  cudaFree(d_images);
+  cudaFree(d_labels);
 
   free_input(images, labels, count);
   return 0;
