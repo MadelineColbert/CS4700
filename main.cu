@@ -35,7 +35,7 @@ TODO:
 
 #define NUM_LAYERS 4
 
-#define BATCH_SIZE 256
+#define BATCH_SIZE 1024
 #define STEP_SIZE 0.05
 #define EPOCHS 100
 
@@ -119,7 +119,7 @@ __global__ void softmax_ce_kernel(float* prob_out, int* labels, float* pre_grad,
         } else {
             correct_pred = 0.0f;
         }
-        pre_grad[tid] = (prob_out[tid] - correct_pred)/((float)batch);
+        pre_grad[tid] = prob_out[tid] - correct_pred;
     }
 }
 
@@ -149,10 +149,12 @@ void init_nn(NN* network) {
         int in_dim  = network->layers[l];
         int out_dim = network->layers[l + 1];
 
+        float xavier_init = sqrtf(6.0f/(in_dim+out_dim));
+
         float* h_W = (float*)calloc(in_dim * out_dim, sizeof(float));
         float* h_b = (float*)calloc(out_dim, sizeof(float));
         for (int i=0; i<in_dim*out_dim; i++){
-          h_W[i] = 0.01;
+          h_W[i] = ((float)rand() / (float)RAND_MAX) * 2 * xavier_init - xavier_init;
         }
         CUDA_CHECK(cudaMemcpy(network->weights[l], h_W, in_dim * out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
@@ -284,10 +286,8 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
         int w_size = network->layers[l] * network->layers[l+1];
         dim3 w_grid((w_size+255)/256);
         dim3 b_grid((255+network->layers[l+1])/256);
-        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE, w_size); 
-        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE, network->layers[l+1]); 
-
-        
+        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE/(float)BATCH_SIZE, w_size); 
+        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE/(float)BATCH_SIZE, network->layers[l+1]);         
     }
 }
 
