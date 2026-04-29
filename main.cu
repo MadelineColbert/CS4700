@@ -4,14 +4,7 @@
 #include <math.h>
 #include "cuda_runtime.h"
 #include "cublas_v2.h"
-
-/*
-TODO:
-- Implement better softmax kernel
-- Update the NN struct to allow for gradients
-- Add sparsity measure
-*/
-
+#include <sys/time.h>
 
 #define CUDA_CHECK(call)                                                  \
     do {                                                                  \
@@ -51,16 +44,13 @@ typedef struct{
     int layers[NUM_LAYERS+1];
 } NN;
 
-__global__ void relu_kernel(float* pre_act,
-                            float* post_act,
-                            int out_dim,
-                            int batch)
-{
+__global__ void add_bias_and_relu_kernel(float* pre_act, float* post_act, float* bias, int out_dim, int batch){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch){
-        int index = col*out_dim+row;
-        post_act[index] = fmaxf(0.0f, pre_act[index]);
+      int index = col*out_dim+row;
+      int val = pre_act[index] + bias[row];
+      post_act[index] = fmaxf(0.0f, val);
     }
 }
 
@@ -89,13 +79,31 @@ __global__ void softmax_kernel(float* in, float* out, int length, int batch_size
     }
 }
 
-__global__ void add_bias(float* data, float* bias, int out_dim, int batch){
+__global__ void softmax_add_bias_and_get_local_max_kernel(float* in, float* out, float* bias, int out_dim, int batch_dim){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch){
         int index = col*out_dim+row;
         data[index] += bias[row];
     }
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= batch_size) return;
+
+    const float* src = in + col * length;
+    float* dst = out + col * length; 
+
+    float mx = src[0];
+    for (int i = 1; i < length; i++) {
+        mx = fmaxf(mx, src[i]);
+    }
+}
+
+__global__ void softmax_sum_kernel(float* in, float* out, float* bias, int out_dim, int batch_dim){
+
+}
+
+__global__ void softmax_average_kernel(float* in, float* out, float* bias, int out_dim, int batch_dim){
+
 }
 
 __global__ void bias_grad_kernel(float* pre_act, float* bias, int out_dim, int batch){
@@ -211,17 +219,16 @@ void forward(NN* network, float* input, cublasHandle_t handle){
                         network->pre_act[l], network->layers[l+1]));
         dim3 blockDim(16,16);
         dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x,
-                  (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
-
-        add_bias<<<gridDim, blockDim>>>(network->pre_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
+                  (BATCH_SIZE + blockDim.y - 1) / blockDim.y);        
 
         if (l == NUM_LAYERS-1){
-            // This is bad for now, figure out later...
-            int threads = 256;
-            int blocks = (BATCH_SIZE + threads - 1) / threads;
-            softmax_kernel<<<blocks, threads>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
+            softmax_add_bias_and_get_local_max_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
+            softmax_sum_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
+            softmax_average_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
+            //int threads = 256;
+            //int blocks = (BATCH_SIZE + threads - 1) / threads;
         } else {
-            relu_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l],network->layers[l+1], BATCH_SIZE);
+            add_bias_and_relu_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
         }
     }
 }
@@ -412,6 +419,8 @@ int main() {
 
   int batches_per_epoch = count/BATCH_SIZE;
 
+  struct timeval start, end;
+  gettimeofday(&start, NULL);
   for (int iter=0; iter < EPOCHS; iter++){
     for (int batch=0; batch < batches_per_epoch; batch++){
         // Since the batches per epoch is just integer division, we remove the remaining images.
@@ -427,10 +436,12 @@ int main() {
                     network.post_act[NUM_LAYERS - 1],
                     d_labels,
                     network.layers[NUM_LAYERS]);
-        printf("Epoch %d  batch %d/%d  loss = %f\n",
-                       iter + 1, batch, batches_per_epoch, loss);
+        //printf("Epoch %d  batch %d/%d  loss = %f\n",iter + 1, batch, batches_per_epoch, loss);
     }
   }
+  gettimeofday(&end, NULL);
+  double seconds = ((end.tv_sec - start.tv_sec) * 1000000.0 + (end.tv_usec - start.tv_usec))/1000000.0;
+  printf("Time taken: %.16f seconds\n", seconds);
 
   free_nn(&network);
   cudaFree(d_images);
