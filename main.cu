@@ -35,9 +35,10 @@ TODO:
 
 #define NUM_LAYERS 4
 
-#define BATCH_SIZE 1024
+#define BATCH_SIZE 256
 #define STEP_SIZE 0.05
 #define EPOCHS 100
+#define l2_regularizer 0.1
 
 typedef struct{
     float* weights[NUM_LAYERS];
@@ -46,6 +47,11 @@ typedef struct{
     float *post_act[NUM_LAYERS];
     float *pre_grad[NUM_LAYERS];
     float *post_grad[NUM_LAYERS];
+
+    float *g[NUM_LAYERS];
+    float *g_grad[NUM_LAYERS];
+    float *post_g[NUM_LAYERS];
+
     float *w_grad[NUM_LAYERS];
     float *b_grad[NUM_LAYERS];
     int layers[NUM_LAYERS+1];
@@ -70,7 +76,7 @@ __global__ void softmax_kernel(float* in, float* out, int length, int batch_size
     if (col >= batch_size) return;
 
     const float* src = in + col * length;
-    float* dst = out + col * length; 
+    float* dst = out + col * length;
 
     float mx = src[0];
     for (int i = 1; i < length; i++) {
@@ -95,6 +101,13 @@ __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
     if (row < out_dim && col < batch){
         int index = col*out_dim+row;
         data[index] += bias[row];
+    }
+}
+
+__global__ void l2_regularization(float* params, float norm, float LR, int n){
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n){
+        params[tid] -= LR*norm;
     }
 }
 
@@ -144,6 +157,19 @@ __global__ void sgd_kernel(float* params, float* grad, float LR, int n){
     }
 }
 
+__global__ void gate_mult(float* weights, float* g, float* post_g, int in, int out ){
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row < out && col < in){
+        int tid = out*col + row;
+        if (g[tid] > 0.5){
+            post_g[tid] = weights[tid];
+        } else{
+            post_g[tid] = 0;
+        }
+    }
+}
+
 void init_nn(NN* network) {
     for (int l = 0; l < NUM_LAYERS; l++) {
         int in_dim  = network->layers[l];
@@ -152,13 +178,17 @@ void init_nn(NN* network) {
         float xavier_init = sqrtf(6.0f/(in_dim+out_dim));
 
         float* h_W = (float*)calloc(in_dim * out_dim, sizeof(float));
+        float* g = (float*)calloc(in_dim * out_dim, sizeof(float));
         float* h_b = (float*)calloc(out_dim, sizeof(float));
         for (int i=0; i<in_dim*out_dim; i++){
           h_W[i] = ((float)rand() / (float)RAND_MAX) * 2 * xavier_init - xavier_init;
+          g[i] = 1.0f;
         }
         CUDA_CHECK(cudaMemcpy(network->weights[l], h_W, in_dim * out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(network->bias[l], h_b, out_dim * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(network->g[l], g, in_dim * out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
         free(h_W);
         free(h_b);
@@ -176,6 +206,11 @@ void define_nn(NN* network){
         CUDA_CHECK(cudaMalloc(&network->b_grad[l], out_dim*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&network->pre_act[l], BATCH_SIZE*out_dim*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&network->pre_grad[l], BATCH_SIZE*out_dim*sizeof(float)));
+
+        CUDA_CHECK(cudaMalloc(&network->g[l], in_dim*out_dim*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&network->g_grad[l], in_dim*out_dim*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&network->post_g[l], in_dim*out_dim*sizeof(float)));
+
         CUDA_CHECK(cudaMalloc(&network->post_grad[l], BATCH_SIZE*out_dim*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&network->post_act[l], BATCH_SIZE*out_dim*sizeof(float)));
     }
@@ -188,6 +223,11 @@ void free_nn(NN* network){
         CUDA_CHECK(cudaFree(network->pre_act[l]));
         CUDA_CHECK(cudaFree(network->post_act[l]));
         CUDA_CHECK(cudaFree(network->b_grad[l]));
+
+        CUDA_CHECK(cudaFree(network->g[l]));
+        CUDA_CHECK(cudaFree(network->g_grad[l]));
+        CUDA_CHECK(cudaFree(network->post_g[l]));
+
         CUDA_CHECK(cudaFree(network->pre_grad[l]));
         CUDA_CHECK(cudaFree(network->post_grad[l]));
         CUDA_CHECK(cudaFree(network->w_grad[l]));
@@ -204,11 +244,18 @@ void forward(NN* network, float* input, cublasHandle_t handle){
         } else{
             in = network->post_act[l-1];
         }
+
+        dim3 gate_block(16,16);
+        dim3 gate_grid((network->layers[l+1]+15)/16,
+                (network->layers[l]+15)/16);
+        gate_mult<<<gate_grid, gate_block>>>(network->weights[l], network->g[l], network->post_g[l], network->layers[l], network->layers[l+1]);
+
         CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                         network->layers[l+1], BATCH_SIZE, network->layers[l],
-                        &one, network->weights[l], network->layers[l+1],
+                        &one, network->post_g[l], network->layers[l+1],
                         in, network->layers[l], &zero,
                         network->pre_act[l], network->layers[l+1]));
+
         dim3 blockDim(16,16);
         dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x,
                   (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
@@ -232,10 +279,10 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
     float* in;
 
     dim3 block_256(256);
-    dim3 block_ce(16, 16); 
-    dim3 grid_ce((network->layers[NUM_LAYERS] + block_ce.x - 1) / block_ce.x, 
+    dim3 block_ce(16, 16);
+    dim3 grid_ce((network->layers[NUM_LAYERS] + block_ce.x - 1) / block_ce.x,
                 (BATCH_SIZE + block_ce.y - 1) / block_ce.y);
-    
+
     // Start by initializing with cross entropy loss (Divided by batch size is handled here)
     softmax_ce_kernel<<<grid_ce, block_ce>>>(network->post_act[NUM_LAYERS-1], labels, network->pre_grad[NUM_LAYERS-1], network->layers[NUM_LAYERS], BATCH_SIZE);
 
@@ -248,12 +295,12 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
         }
 
         // Gradient of W = gradient of pre_activation * input^T
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, 
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
                                 network->layers[l+1], network->layers[l], BATCH_SIZE,
                                 &one, network->pre_grad[l], network->layers[l+1],
                                 in, network->layers[l], &zero,
                                 network->w_grad[l], network->layers[l+1]));
-        
+
         // Sum over the batch of pre-gradients to get the bias gradient
         dim3 b_grad_block(256);
         dim3 b_grad_grid((network->layers[l+1] + 255) / 256);
@@ -286,8 +333,11 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
         int w_size = network->layers[l] * network->layers[l+1];
         dim3 w_grid((w_size+255)/256);
         dim3 b_grid((255+network->layers[l+1])/256);
-        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE/(float)BATCH_SIZE, w_size); 
-        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE/(float)BATCH_SIZE, network->layers[l+1]);         
+        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE/(float)BATCH_SIZE, w_size);
+        
+        l2_regularization<<<w_grid, block_256>>>(network->g[l], l2_regularizer, STEP_SIZE/(float)BATCH_SIZE, w_size);
+        
+        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE/(float)BATCH_SIZE, network->layers[l+1]);
     }
 }
 
@@ -416,8 +466,8 @@ int main() {
     for (int batch=0; batch < batches_per_epoch; batch++){
         // Since the batches per epoch is just integer division, we remove the remaining images.
         int offset = batch * BATCH_SIZE;
-        
-        // Add starting address so that 
+
+        // Add starting address so that
         cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
