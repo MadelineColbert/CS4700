@@ -6,7 +6,11 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 find_package(CUDA REQUIRED)
 
+<<<<<<< HEAD
 set(PROJECT_SOURCES 
+=======
+set(PROJECT_SOURCES
+>>>>>>> main
     main.cu
 )
 

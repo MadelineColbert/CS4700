@@ -43,6 +43,9 @@
 #define STEP_SIZE 0.05
 #define EPOCHS 10
 #define l2_regularizer 0.15
+#define IMAGE_LENGTH 28
+#define OUTPUT_LAYER_SIZE 10
+#define INTERNAL_LAYER_SIZE 100
 
 typedef struct{
     float* weights[NUM_LAYERS];
@@ -658,14 +661,14 @@ void load_mnist(char* image_file, char* label_file, float** images, int** labels
     int dim_2 = mnist_bin_to_int(tmp);
 
     *count = image_cnt;
-    *images = (float*)malloc(sizeof(float)*image_cnt*28*28);
+    *images = (float*)malloc(sizeof(float)*image_cnt*IMAGE_LENGTH*IMAGE_LENGTH);
     *labels = (int*)malloc(sizeof(int)*image_cnt);
 
     for (int i=0; i< image_cnt; i++) {
-        unsigned char read_data[28*28];
-        fread(read_data, 1, 28*28, ifp);
-        for (int j=0; j < 28*28; j++){
-            (*images)[i*28*28 + j] = read_data[j] / 255.0f;
+        unsigned char read_data[IMAGE_LENGTH*IMAGE_LENGTH];
+        fread(read_data, 1, IMAGE_LENGTH*IMAGE_LENGTH, ifp);
+        for (int j=0; j < IMAGE_LENGTH*IMAGE_LENGTH; j++){
+            (*images)[i*IMAGE_LENGTH*IMAGE_LENGTH + j] = read_data[j] / 255.0f;
         }
         fread(tmp, 1, 1, lfp);
         (*labels)[i] = (int)tmp[0];
@@ -705,46 +708,99 @@ float compute_loss(const float* d_probs, const int* d_labels,
     return loss / (float)BATCH_SIZE;
 }
 
-void train(float decay, Gates gate, float threshold){
-    NN network;
-    cublasHandle_t handle;
-    network.layers[0] = 784;
-    network.layers[1] = 100;
-    network.layers[2] = 100;
-    network.layers[3] = 100;
-    network.layers[4] = 10;
+void test_nn(NN* network, cublasHandle_t handle){
     float* images = NULL;
     int* labels=NULL;
-    int count=0;
+    int image_count=0;
 
-    load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
-
-    define_nn(&network);
-
-    init_nn(&network);
+    load_mnist("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte", &images, &labels, &image_count);
 
     float* d_images;
-    CUDA_CHECK(cudaMalloc(&d_images, 28*28 * BATCH_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_images, IMAGE_LENGTH*IMAGE_LENGTH * BATCH_SIZE * sizeof(float)));
+
+    int batches_per_iter = image_count/BATCH_SIZE;
+    int correct_pred_count = 0;
+
+    for (int batch=0; batch < batches_per_iter; batch++){
+        int offset = batch * BATCH_SIZE;
+        
+        cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+
+        forward(network, d_images, handle);
+
+        float* h_outputs = (float*)malloc(BATCH_SIZE * OUTPUT_LAYER_SIZE * sizeof(float));
+
+        cudaMemcpy(h_outputs, network->post_act[NUM_LAYERS-1], BATCH_SIZE * OUTPUT_LAYER_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        for(int image=0; image < BATCH_SIZE; image++){
+            int image_offset = image * OUTPUT_LAYER_SIZE;
+
+            float maxOutput = h_outputs[image_offset];
+            int maxOutputIndex = 0;
+
+            for(int outputIndex=1; outputIndex < OUTPUT_LAYER_SIZE; outputIndex++){
+                float output = h_outputs[image_offset + outputIndex];;
+
+                if(output > maxOutput){
+                    maxOutput = output;
+                    maxOutputIndex = outputIndex;
+                }
+            }
+
+            if(labels[offset+image] == maxOutputIndex){
+                correct_pred_count++;
+            }
+        }
+    }
+
+    float percentage = correct_pred_count / ((float) image_count) * 100.0f; 
+    printf("%d/%d (%.2f%%) correctly predicted\n", correct_pred_count, image_count, percentage);
+
+    cudaFree(d_images);
+    free_input(images, labels, image_count);
+}
+
+void train(float decay, Gates gate, float threshold){
+  for(int k=0; k<10; k++){
+    printf("Iteration %d:\n",k);
+        NN network;
+        cublasHandle_t handle;
+        network.layers[0] = IMAGE_LENGTH * IMAGE_LENGTH;
+        network.layers[1] = INTERNAL_LAYER_SIZE;
+        network.layers[2] = INTERNAL_LAYER_SIZE;
+        network.layers[3] = INTERNAL_LAYER_SIZE;
+        network.layers[4] = OUTPUT_LAYER_SIZE;
+        float* images = NULL;
+        int* labels=NULL;
+        int count=0;
+
+        load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
+
+        define_nn(&network);
+
+        init_nn(&network);
+
+    float* d_images;
+    CUDA_CHECK(cudaMalloc(&d_images, IMAGE_LENGTH*IMAGE_LENGTH * BATCH_SIZE * sizeof(float)));
 
     int* d_labels;
     CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
 
+        cublasStatus_t state = cublasCreate(&handle);
 
-    cublasStatus_t state = cublasCreate(&handle);
+        if (state != CUBLAS_STATUS_SUCCESS){
+            printf("HANDLE CREATION");
+        }
 
-    if (state != CUBLAS_STATUS_SUCCESS){
-        printf("HANDLE CREATION");
-    }
-
-    int batches_per_epoch = count/BATCH_SIZE;
+        int batches_per_epoch = count/BATCH_SIZE;
 
     for (int iter=0; iter < EPOCHS; iter++){
         for (int batch=0; batch < batches_per_epoch; batch++){
             // Since the batches per epoch is just integer division, we remove the remaining images.
             int offset = batch * BATCH_SIZE;
-
-            // Add starting address so that
-            cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+            
+            // Add starting address so that 
+            cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
             forward(&network, d_images, handle, gate);
@@ -753,10 +809,11 @@ void train(float decay, Gates gate, float threshold){
                         network.post_act[NUM_LAYERS - 1],
                         d_labels,
                         network.layers[NUM_LAYERS]);
-            printf("Epoch %d  batch %d/%d  loss = %f\n",
-                        iter + 1, batch, batches_per_epoch, loss);
+            //printf("Epoch %d  batch %d/%d  loss = %f\n", iter + 1, batch, batches_per_epoch, loss);
         }
     }
+
+    test_nn(&network, handle);
 
     post_processing(&network, threshold);
 
@@ -795,6 +852,7 @@ void train(float decay, Gates gate, float threshold){
     cublasDestroy(handle);
 
     free_input(images, labels, count);
+    }
 }
 
 int main() {
