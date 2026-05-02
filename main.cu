@@ -4,13 +4,7 @@
 #include <math.h>
 #include "cuda_runtime.h"
 #include "cublas_v2.h"
-
-/*
-TODO:
-- Implement better softmax kernel
-- Update the NN struct to allow for gradients
-- Add sparsity measure
-*/
+#include <cusparse.h>
 
 
 #define CUDA_CHECK(call)                                                  \
@@ -33,11 +27,21 @@ TODO:
         }                                                                 \
     } while (0)
 
+#define CUSPARSE_CHECK(call)                                              \
+    do {                                                                  \
+        cusparseStatus_t _s = (call);                                     \
+        if (_s != CUSPARSE_STATUS_SUCCESS) {                              \
+            fprintf(stderr, "cuSPARSE error %s:%d — code %d\n",           \
+                    __FILE__, __LINE__, (int)_s);                         \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    } while (0)
+
 #define NUM_LAYERS 4
 
 #define BATCH_SIZE 256
 #define STEP_SIZE 0.05
-#define EPOCHS 100
+#define EPOCHS 10
 #define l2_regularizer 0.15
 
 typedef struct{
@@ -56,6 +60,34 @@ typedef struct{
     float *b_grad[NUM_LAYERS];
     int layers[NUM_LAYERS+1];
 } NN;
+
+typedef enum { LAYER_SPARSE, LAYER_DENSE } LayerType;
+
+typedef struct {
+    LayerType type[NUM_LAYERS];
+
+    float *csrVal[NUM_LAYERS];
+    int *csrRowPtr[NUM_LAYERS];
+    int *csrColInd[NUM_LAYERS];
+    cusparseSpMatDescr_t matDescr[NUM_LAYERS];
+
+    float *denseW[NUM_LAYERS];
+
+    float *bias[NUM_LAYERS];
+    int in_dims[NUM_LAYERS];
+    int out_dims[NUM_LAYERS];
+    int nnz[NUM_LAYERS];
+} PostProcessedNN;
+
+enum Pruning {
+    PRUNING,
+    NO_PRUNE
+};
+
+enum Gates{
+    GATES,
+    NO_GATES
+};
 
 __global__ void relu_kernel(float* pre_act,
                             float* post_act,
@@ -104,7 +136,7 @@ __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
     }
 }
 
-__global__ void l2_regularization(float* params, float* g_grad, float* weights, float norm, float LR, int n){
+__global__ void regularization(float* params, float* g_grad, float* weights, float norm, float LR, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
         float final_g = g_grad[tid] * weights[tid];
@@ -143,6 +175,46 @@ __global__ void softmax_ce_kernel(float* prob_out, int* labels, float* pre_grad,
     }
 }
 
+__global__ void l2_pruning(float* weights, float threshold, int neurons, int inputs){
+    extern __shared__ float neuron_sums[];
+
+    int neuron = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (neuron > neurons){
+        return;
+    }
+
+    int starting_idx = neuron * inputs;
+    float thread_sum =0;
+
+    for (int i=tid; i < inputs; i++){
+        float curr_w = weights[i+starting_idx];
+        thread_sum += curr_w * curr_w;
+    }
+
+    neuron_sums[tid] = thread_sum;
+    __syncthreads();
+
+    for (int tds = blockDim.x/2; tds > 0; tds/=2){
+        if (tid < tds){
+            neuron_sums[tid] += neuron_sums[tid+tds]; 
+        }
+        __syncthreads();
+    }
+
+    __shared__ bool prune;
+    if (tid == 0){
+        float l2_norm = sqrtf(neuron_sums[0]);
+        prune = (l2_norm < threshold);
+    }
+
+    if (prune) {
+        for (int i=tid; i < inputs; i++){
+            weights[i+starting_idx] = 0;
+        }
+    }
+}
 
 __global__ void relu_backward_kernel(const float* grad_out,
                                      const float* pre_act,
@@ -157,10 +229,19 @@ __global__ void relu_backward_kernel(const float* grad_out,
     }
 }
 
-__global__ void sgd_kernel(float* params, float* grad, float LR, int n){
+__global__ void sgd_kernel(float* params, float* grad, float LR, int n, float decay){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
-        params[tid] -= LR * grad[tid];
+        params[tid] = (1-LR*decay)*params[tid] - (LR * grad[tid]);
+    }
+}
+
+__global__ void remove_gates(float* weights, float* g, int n){
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n){
+        if (g[tid] > 0.5){
+            weights[tid] = 0;
+        }
     }
 }
 
@@ -250,7 +331,25 @@ void free_nn(NN* network){
     }
 }
 
-void forward(NN* network, float* input, cublasHandle_t handle){
+void free_optimized_nn(PostProcessedNN* optNet) {
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        // Shared Bias
+        if (optNet->bias[l]) CUDA_CHECK(cudaFree(optNet->bias[l]));
+
+        if (optNet->type[l] == LAYER_SPARSE) {
+            // Sparse-specific cleanup
+            if (optNet->csrVal[l])    CUDA_CHECK(cudaFree(optNet->csrVal[l]));
+            if (optNet->csrRowPtr[l]) CUDA_CHECK(cudaFree(optNet->csrRowPtr[l]));
+            if (optNet->csrColInd[l]) CUDA_CHECK(cudaFree(optNet->csrColInd[l]));
+            if (optNet->matDescr[l])  CUSPARSE_CHECK(cusparseDestroySpMat(optNet->matDescr[l]));
+        } else {
+            // Dense-specific cleanup
+            if (optNet->denseW[l])    CUDA_CHECK(cudaFree(optNet->denseW[l]));
+        }
+    }
+}
+
+void forward(NN* network, float* input, cublasHandle_t handle, Gates gate){
     float one = 1.0f;
     float zero= 0.0f;
     float* in;
@@ -261,16 +360,25 @@ void forward(NN* network, float* input, cublasHandle_t handle){
             in = network->post_act[l-1];
         }
 
-        dim3 gate_block(16,16);
-        dim3 gate_grid((network->layers[l+1]+15)/16,
-                (network->layers[l]+15)/16);
-        gate_mult<<<gate_grid, gate_block>>>(network->weights[l], network->g[l], network->post_g[l], network->layers[l], network->layers[l+1]);
+        if (gate == GATES) {
+            dim3 gate_block(16,16);
+            dim3 gate_grid((network->layers[l+1]+15)/16,
+                    (network->layers[l]+15)/16);
+            gate_mult<<<gate_grid, gate_block>>>(network->weights[l], network->g[l], network->post_g[l], network->layers[l], network->layers[l+1]);
 
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            network->layers[l+1], BATCH_SIZE, network->layers[l],
+                            &one, network->post_g[l], network->layers[l+1],
+                            in, network->layers[l], &zero,
+                            network->pre_act[l], network->layers[l+1]));
+        }
+        else {
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                         network->layers[l+1], BATCH_SIZE, network->layers[l],
-                        &one, network->post_g[l], network->layers[l+1],
+                        &one, network->weights[l], network->layers[l+1],
                         in, network->layers[l], &zero,
                         network->pre_act[l], network->layers[l+1]));
+        }
 
         dim3 blockDim(16,16);
         dim3 gridDim((network->layers[l+1] + blockDim.x - 1) / blockDim.x,
@@ -289,7 +397,7 @@ void forward(NN* network, float* input, cublasHandle_t handle){
     }
 }
 
-void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
+void backward(NN* network, float* input, int* labels, cublasHandle_t handle, float decay, Gates gate){
     float one = 1.0f;
     float zero= 0.0f;
     float* in;
@@ -320,8 +428,10 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
                                 in, network->layers[l], &zero,
                                 network->w_grad[l], network->layers[l+1]));
 
-        l2_regularization<<<w_grid, block_256>>>(network->g[l], network->w_grad[l], network->weights[l], l2_regularizer, STEP_SIZE/(float)BATCH_SIZE, w_size);
-        mask_w_grad<<<w_grid, block_256>>>(network->w_grad[l], network->g[l], w_size);
+        if (gate == GATES){
+            regularization<<<w_grid, block_256>>>(network->g[l], network->w_grad[l], network->weights[l], l2_regularizer, STEP_SIZE/(float)BATCH_SIZE, w_size);
+            mask_w_grad<<<w_grid, block_256>>>(network->w_grad[l], network->g[l], w_size);
+        }
 
         // Sum over the batch of pre-gradients to get the bias gradient
         dim3 b_grad_block(256);
@@ -333,12 +443,22 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
             int prev_out = network->layers[l];
 
             // Backpropagate past the weights into the previous layer
-            CUBLAS_CHECK(cublasSgemm(handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                network->layers[l], BATCH_SIZE, network->layers[l+1],
-                &one,  network->post_g[l], network->layers[l+1],
-                       network->pre_grad[l], network->layers[l+1],
-                &zero, network->post_grad[l-1],   network->layers[l]));
+            if (gate == GATES){
+                 CUBLAS_CHECK(cublasSgemm(handle,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        network->layers[l], BATCH_SIZE, network->layers[l+1],
+                        &one,  network->post_g[l], network->layers[l+1],
+                            network->pre_grad[l], network->layers[l+1],
+                        &zero, network->post_grad[l-1],   network->layers[l]));
+            } else {
+                CUBLAS_CHECK(cublasSgemm(handle,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        network->layers[l], BATCH_SIZE, network->layers[l+1],
+                        &one,  network->weights[l], network->layers[l+1],
+                            network->pre_grad[l], network->layers[l+1],
+                        &zero, network->post_grad[l-1],   network->layers[l]));
+            }
+           
 
 
             // Handle the ReLU activation gradient from pre-act to post-act
@@ -352,9 +472,149 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle){
         }
 
         // SGD Parameter Update
-        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE/(float)BATCH_SIZE, w_size);
+        sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], STEP_SIZE/(float)BATCH_SIZE, w_size, decay);
         
-        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE/(float)BATCH_SIZE, network->layers[l+1]);
+        sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], STEP_SIZE/(float)BATCH_SIZE, network->layers[l+1], decay);
+    }
+}
+
+void post_processing(NN* network, float threshold){
+    for (int l =0; l < NUM_LAYERS; l++){
+
+        int threads = 256;
+        int blocks = ((network->layers[l] * network->layers[l+1]) + threads - 1) / threads;
+        remove_gates<<<blocks, threads>>>(network->weights[l], network->g[l], network->layers[l] * network->layers[l+1]);
+
+        l2_pruning<<<network->layers[l+1], 256, 256 * sizeof(float)>>>(
+            network->weights[l], threshold, network->layers[l+1], network->layers[l]);
+    }
+}
+
+void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutoff) {
+    cusparseHandle_t spHandle;
+    CUSPARSE_CHECK(cusparseCreate(&spHandle));
+
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        int orig_in = oldNet->layers[l];
+        int orig_out = oldNet->layers[l+1];
+        
+        float* h_W = (float*)malloc(orig_in * orig_out * sizeof(float));
+        float* h_b = (float*)malloc(orig_out * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(h_W, oldNet->weights[l], orig_in * orig_out * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_b, oldNet->bias[l], orig_out * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // 1. Identify "Live" Neurons (Remove rows that are all zero)
+        int live_neurons = 0;
+        int* live_indices = (int*)malloc(orig_out * sizeof(int));
+        for (int r = 0; r < orig_out; r++) {
+            bool is_dead = true;
+            for (int c = 0; c < orig_in; c++) {
+                if (fabsf(h_W[c * orig_out + r]) > 1e-9f) {
+                    is_dead = false;
+                    break;
+                }
+            }
+            if (!is_dead) live_indices[live_neurons++] = r;
+        }
+
+        optNet->in_dims[l] = orig_in;
+        optNet->out_dims[l] = live_neurons;
+
+        // 2. Extract live weights into a temporary compact buffer
+        float* h_compactW = (float*)malloc(orig_in * live_neurons * sizeof(float));
+        float* h_compactB = (float*)malloc(live_neurons * sizeof(float));
+        int total_nnz = 0;
+
+        for (int r_idx = 0; r_idx < live_neurons; r_idx++) {
+            int original_row = live_indices[r_idx];
+            h_compactB[r_idx] = h_b[original_row];
+            for (int c = 0; c < orig_in; c++) {
+                float val = h_W[c * orig_out + original_row];
+                h_compactW[c * live_neurons + r_idx] = val;
+                if (fabsf(val) > 1e-9f) total_nnz++;
+            }
+        }
+
+        float density = (float)total_nnz / (orig_in * live_neurons);
+        optNet->nnz[l] = total_nnz;
+        CUDA_CHECK(cudaMalloc(&optNet->bias[l], live_neurons * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(optNet->bias[l], h_compactB, live_neurons * sizeof(float), cudaMemcpyHostToDevice));
+
+        // 3. Choose Sparse vs Dense
+        if (density > dense_cutoff) {
+            optNet->type[l] = LAYER_DENSE;
+            CUDA_CHECK(cudaMalloc(&optNet->denseW[l], orig_in * live_neurons * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(optNet->denseW[l], h_compactW, orig_in * live_neurons * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            optNet->type[l] = LAYER_SPARSE;
+            // Build CSR from compact weights
+            float* h_csrVal = (float*)malloc(total_nnz * sizeof(float));
+            int* h_csrColInd = (int*)malloc(total_nnz * sizeof(int));
+            int* h_csrRowPtr = (int*)malloc((live_neurons + 1) * sizeof(int));
+            int curr_nnz = 0;
+            for (int r = 0; r < live_neurons; r++) {
+                h_csrRowPtr[r] = curr_nnz;
+                for (int c = 0; c < orig_in; c++) {
+                    float val = h_compactW[c * live_neurons + r];
+                    if (fabsf(val) > 1e-9f) {
+                        h_csrVal[curr_nnz] = val;
+                        h_csrColInd[curr_nnz] = c;
+                        curr_nnz++;
+                    }
+                }
+            }
+            h_csrRowPtr[live_neurons] = curr_nnz;
+
+            CUDA_CHECK(cudaMalloc(&optNet->csrVal[l], total_nnz * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&optNet->csrColInd[l], total_nnz * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(&optNet->csrRowPtr[l], (live_neurons + 1) * sizeof(int)));
+            CUDA_CHECK(cudaMemcpy(optNet->csrVal[l], h_csrVal, total_nnz * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(optNet->csrColInd[l], h_csrColInd, total_nnz * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(optNet->csrRowPtr[l], h_csrRowPtr, (live_neurons + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+            CUSPARSE_CHECK(cusparseCreateCsr(&optNet->matDescr[l], live_neurons, orig_in, total_nnz,
+                                             optNet->csrRowPtr[l], optNet->csrColInd[l], optNet->csrVal[l],
+                                             CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+            free(h_csrVal); free(h_csrColInd); free(h_csrRowPtr);
+        }
+
+        free(h_W); free(h_b); free(h_compactW); free(h_compactB); free(live_indices);
+    }
+    cusparseDestroy(spHandle);
+}
+
+void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buffers, cublasHandle_t cbHandle, cusparseHandle_t spHandle) {
+    float one = 1.0f, zero = 0.0f;
+
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        float* in = (l == 0) ? d_input : act_buffers[l-1];
+        float* out = act_buffers[l];
+
+        if (optNet->type[l] == LAYER_DENSE) {
+            CUBLAS_CHECK(cublasSgemm(cbHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                     optNet->out_dims[l], BATCH_SIZE, optNet->in_dims[l],
+                                     &one, optNet->denseW[l], optNet->out_dims[l],
+                                     in, optNet->in_dims[l], &zero, out, optNet->out_dims[l]));
+        } else {
+            cusparseDnMatDescr_t matIn, matOut;
+            cusparseCreateDnMat(&matIn, optNet->in_dims[l], BATCH_SIZE, optNet->in_dims[l], in, CUDA_R_32F, CUSPARSE_ORDER_COL);
+            cusparseCreateDnMat(&matOut, optNet->out_dims[l], BATCH_SIZE, optNet->out_dims[l], out, CUDA_R_32F, CUSPARSE_ORDER_COL);
+            
+            size_t bufSize = 0;
+            cusparseSpMM_bufferSize(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &bufSize);
+            void* d_buf; cudaMalloc(&d_buf, bufSize);
+            cusparseSpMM(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                         &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, d_buf);
+            
+            cudaFree(d_buf);
+            cusparseDestroyDnMat(matIn); cusparseDestroyDnMat(matOut);
+        }
+
+        dim3 block(16, 16), grid((optNet->out_dims[l] + 15)/16, (BATCH_SIZE + 15)/16);
+        add_bias<<<grid, block>>>(out, optNet->bias[l], optNet->out_dims[l], BATCH_SIZE);
+        if (l == NUM_LAYERS-1) softmax_kernel<<<(BATCH_SIZE+255)/256, 256>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
+        else relu_kernel<<<grid, block>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
     }
 }
 
@@ -445,74 +705,106 @@ float compute_loss(const float* d_probs, const int* d_labels,
     return loss / (float)BATCH_SIZE;
 }
 
-int main() {
-  NN network;
-  cublasHandle_t handle;
-  network.layers[0] = 784;
-  network.layers[1] = 100;
-  network.layers[2] = 100;
-  network.layers[3] = 100;
-  network.layers[4] = 10;
+void train(float decay, Gates gate, float threshold){
+    NN network;
+    cublasHandle_t handle;
+    network.layers[0] = 784;
+    network.layers[1] = 100;
+    network.layers[2] = 100;
+    network.layers[3] = 100;
+    network.layers[4] = 10;
+    float* images = NULL;
+    int* labels=NULL;
+    int count=0;
 
-  float* images = NULL;
-  int* labels=NULL;
-  int count=0;
+    load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 
-  load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
+    define_nn(&network);
 
-  define_nn(&network);
+    init_nn(&network);
 
-  init_nn(&network);
+    float* d_images;
+    CUDA_CHECK(cudaMalloc(&d_images, 28*28 * BATCH_SIZE * sizeof(float)));
 
-  float* d_images;
-  CUDA_CHECK(cudaMalloc(&d_images, 28*28 * BATCH_SIZE * sizeof(float)));
-
-  int* d_labels;
-  CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
+    int* d_labels;
+    CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
 
 
-  cublasStatus_t state = cublasCreate(&handle);
+    cublasStatus_t state = cublasCreate(&handle);
 
-  if (state != CUBLAS_STATUS_SUCCESS){
-    printf("HANDLE CREATION");
-  }
-
-  int batches_per_epoch = count/BATCH_SIZE;
-
-  for (int iter=0; iter < EPOCHS; iter++){
-    for (int batch=0; batch < batches_per_epoch; batch++){
-        // Since the batches per epoch is just integer division, we remove the remaining images.
-        int offset = batch * BATCH_SIZE;
-
-        // Add starting address so that
-        cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
-
-        forward(&network, d_images, handle);
-        backward(&network, d_images, d_labels, handle);
-        float loss = compute_loss(
-                    network.post_act[NUM_LAYERS - 1],
-                    d_labels,
-                    network.layers[NUM_LAYERS]);
-        printf("Epoch %d  batch %d/%d  loss = %f\n",
-                       iter + 1, batch, batches_per_epoch, loss);
+    if (state != CUBLAS_STATUS_SUCCESS){
+        printf("HANDLE CREATION");
     }
-  }
 
-  float* gates;
+    int batches_per_epoch = count/BATCH_SIZE;
 
-  gates = (float*)malloc(28*28*100*sizeof(float));
+    for (int iter=0; iter < EPOCHS; iter++){
+        for (int batch=0; batch < batches_per_epoch; batch++){
+            // Since the batches per epoch is just integer division, we remove the remaining images.
+            int offset = batch * BATCH_SIZE;
 
-  CUDA_CHECK(cudaMemcpy(gates, network.g[0], 28*28*100*sizeof(float), cudaMemcpyDeviceToHost));
+            // Add starting address so that
+            cudaMemcpy(d_images, &images[(28*28*offset)], 28*28*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
-  for (int i =0; i < 28*28*100; i++){
-    printf("%f \n", gates[i]);
-  }
+            forward(&network, d_images, handle, gate);
+            backward(&network, d_images, d_labels, handle, decay, gate);
+            float loss = compute_loss(
+                        network.post_act[NUM_LAYERS - 1],
+                        d_labels,
+                        network.layers[NUM_LAYERS]);
+            printf("Epoch %d  batch %d/%d  loss = %f\n",
+                        iter + 1, batch, batches_per_epoch, loss);
+        }
+    }
 
-  free_nn(&network);
-  cudaFree(d_images);
-  cudaFree(d_labels);
+    post_processing(&network, threshold);
 
-  free_input(images, labels, count);
-  return 0;
+    // 2. Initialize and Convert to Optimized Network
+    PostProcessedNN optNet;
+    // Zero out pointers initially to prevent freeing garbage if conversion fails
+    memset(&optNet, 0, sizeof(PostProcessedNN)); 
+    
+    convert_to_optimized(&network, &optNet, 0.3);
+
+    // 3. Prepare for Optimized Inference
+    cusparseHandle_t spHandle;
+    cusparseCreate(&spHandle);
+    
+    // We need new activation buffers because neuron counts (out_dims) may have changed
+    float* opt_act_buffers[NUM_LAYERS];
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        CUDA_CHECK(cudaMalloc(&opt_act_buffers[l], BATCH_SIZE * optNet.out_dims[l] * sizeof(float)));
+    }
+
+    // 4. Run Inference on Test Set (Example)
+    // Assume d_test_images is loaded
+    optimized_forward(&optNet, d_images, opt_act_buffers, handle, spHandle);
+
+    // 5. Cleanup
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        CUDA_CHECK(cudaFree(opt_act_buffers[l]));
+    }
+    cusparseDestroy(spHandle);
+    free_optimized_nn(&optNet);
+
+
+    free_nn(&network);
+    cudaFree(d_images);
+    cudaFree(d_labels);
+    cublasDestroy(handle);
+
+    free_input(images, labels, count);
+}
+
+int main() {
+    printf("====GATES NO DECAY====");
+    train(0.0f, GATES, 1.0f);
+    printf("====GATES DECAY====");
+    train(0.001f, GATES, 1.0f);
+    printf("====NO GATES NO DECAY====");
+    train(0.0f, NO_GATES, 1.0f);
+    printf("====NO GATES DECAY====");
+    train(0.001f, NO_GATES, 1.0f);
+    return 0;
 }
