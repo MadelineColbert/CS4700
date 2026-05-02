@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <sys/time.h>
 #include "cuda_runtime.h"
 #include "cublas_v2.h"
 #include <cusparse.h>
@@ -43,7 +44,7 @@
 #define EPOCHS 100
 #define IMAGE_LENGTH 28
 #define OUTPUT_LAYER_SIZE 10
-#define INTERNAL_LAYER_SIZE 100
+#define ITERATIONS 3
 
 typedef struct{
     float* weights[NUM_LAYERS];
@@ -702,7 +703,7 @@ float compute_loss(const float* d_probs, const int* d_labels,
     return loss / (float)BATCH_SIZE;
 }
 
-void test_nn(PostProcessedNN* network, cublasHandle_t handle){
+float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     float* images = NULL;
     int* labels=NULL;
     int image_count=0;
@@ -764,10 +765,14 @@ void test_nn(PostProcessedNN* network, cublasHandle_t handle){
         CUDA_CHECK(cudaFree(opt_act_buffers[l]));
     }
     cusparseDestroy(spHandle);
+
+    return percentage;
 }
 
-void train(float decay, Gates gate, float threshold, float lamb, float lr){
-  for(int k=0; k<10; k++){
+void train(float decay, Gates gate, float threshold, float lamb, float lr, int INTERNAL_LAYER_SIZE){
+  float* accuracies = (float*)malloc(sizeof(float) * ITERATIONS);
+  double* times = (double*)malloc(sizeof(double) * ITERATIONS);
+  for(int k=0; k<ITERATIONS; k++){
     printf("Iteration %d:\n",k);
         NN network;
         cublasHandle_t handle;
@@ -799,6 +804,9 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr){
         }
 
         int batches_per_epoch = count/BATCH_SIZE;
+    
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
 
     for (int iter=0; iter < EPOCHS; iter++){
         for (int batch=0; batch < batches_per_epoch; batch++){
@@ -819,6 +827,9 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr){
         }
     }
 
+    gettimeofday(&end, NULL);
+    times[k] = ((double)(end.tv_sec - start.tv_sec) + (double)(end.tv_usec - start.tv_usec) / 1e6) * 1000.0;
+    printf("Time taken: %.3f ms\n", times[k]);
     
     post_processing(&network, threshold);
     
@@ -826,7 +837,7 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr){
     
     convert_to_optimized(&network, &optNet, 0.3);
     
-    test_nn(&optNet, handle);
+    accuracies[k] = test_nn(&optNet, handle);
 
     free_optimized_nn(&optNet);
 
@@ -837,16 +848,34 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr){
 
     free_input(images, labels, count);
     }
+
+    float accuracySum = 0;
+    double timeSum = 0;
+    for(int k=0; k<ITERATIONS; k++){
+        accuracySum += accuracies[k];
+        timeSum += times[k];
+    }
+    printf("Average Accuracy: %.2f%%\n", accuracySum/ITERATIONS);
+    printf("Average Time: %.3f ms\n", timeSum/ITERATIONS);
+    free(accuracies);
+    free(times);
 }
 
 int main() {
-    printf("====GATES NO DECAY====");
-    train(0.0f, GATES, 0.5f, 0.01f, 0.05f);
-    printf("====GATES DECAY====");
-    train(0.001f, GATES, 0.5f, 0.01f, 0.05f);
-    printf("====NO GATES DECAY====");
-    train(0.001f, NO_GATES, 0.5f, 0.01f, 0.05f);
-    printf("====NO GATES NO DECAY====");
-    train(0.0f, NO_GATES, 0.0f, 0.01f, 0.05f);    
+    static const float STEP_SIZES[] = {0.025f, 0.05f, 0.075f};
+    static const int INTERNAL_SIZES[] = {128, 256, 512};
+    for(int i=0; i<3; i++){
+        for(int j=0; j<3; j++){
+            printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j]);
+            printf("====GATES NO DECAY====");
+            train(0.0f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
+            printf("====GATES DECAY====");
+            train(0.001f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
+            printf("====NO GATES DECAY====");
+            train(0.001f, NO_GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
+            printf("====NO GATES NO DECAY====");
+            train(0.0f, NO_GATES, 0.0f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);    
+        }
+    }
     return 0;
 }

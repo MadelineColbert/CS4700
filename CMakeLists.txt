@@ -6,15 +6,11 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 find_package(CUDA REQUIRED)
 
-<<<<<<< HEAD
-set(PROJECT_SOURCES 
-=======
-set(PROJECT_SOURCES
->>>>>>> main
-    main.cu
-)
+set(PROJECT_SOURCES main.cu)
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
 
-
-target_link_libraries(${PROJECT_NAME} ${CUDA_CUBLAS_LIBRARIES})
+target_link_libraries(${PROJECT_NAME}
+    ${CUDA_CUBLAS_LIBRARIES}
+    ${CUDA_cusparse_LIBRARY}
+)
