@@ -769,7 +769,21 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     return percentage;
 }
 
-void train(float decay, Gates gate, float threshold, float lamb, float lr, int INTERNAL_LAYER_SIZE){
+void log_result(float step_size, int internal_size, const char* mode, float acc, double time) {
+    FILE* f = fopen("results.csv", "a");
+
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) {
+        fprintf(f, "step_size,internal_size,mode,accuracy,time\n");
+    }
+
+    fprintf(f, "%.6f,%d,%s,%.4f,%.4f\n", step_size, internal_size, mode, acc, time);
+
+    fclose(f);
+}
+
+void train(float decay, Gates gate, float threshold, float lamb, float lr, int INTERNAL_LAYER_SIZE, const char* mode_name){
+  printf("====%s====\n",mode_name);
   float* accuracies = (float*)malloc(sizeof(float) * ITERATIONS);
   double* times = (double*)malloc(sizeof(double) * ITERATIONS);
   for(int k=0; k<ITERATIONS; k++){
@@ -849,14 +863,17 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
     free_input(images, labels, count);
     }
 
-    float accuracySum = 0;
-    double timeSum = 0;
+    float accuracy_sum = 0;
+    double time_sum = 0;
     for(int k=0; k<ITERATIONS; k++){
-        accuracySum += accuracies[k];
-        timeSum += times[k];
+        accuracy_sum += accuracies[k];
+        time_sum += times[k];
     }
-    printf("Average Accuracy: %.2f%%\n", accuracySum/ITERATIONS);
-    printf("Average Time: %.3f ms\n", timeSum/ITERATIONS);
+    float average_accuracy = accuracy_sum / ITERATIONS;
+    double average_time = timeSum/ITERATIONS;
+    log_result(lr, INTERNAL_LAYER_SIZE, mode_name, average_accuracy, average_time);
+    printf("Average Accuracy: %.2f%%\n", average_accuracy);
+    printf("Average Time: %.3f ms\n", average_time);
     free(accuracies);
     free(times);
 }
@@ -864,17 +881,18 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
 int main() {
     static const float STEP_SIZES[] = {0.025f, 0.05f, 0.075f};
     static const int INTERNAL_SIZES[] = {128, 256, 512};
+    static const char* MODE_NAMES[] = {"GATES NO DECAY","GATES DECAY","NO GATES DECAY","NO GATES NO DECAY"};
     for(int i=0; i<3; i++){
         for(int j=0; j<3; j++){
-            printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j]);
-            printf("====GATES NO DECAY====");
-            train(0.0f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
-            printf("====GATES DECAY====");
-            train(0.001f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
-            printf("====NO GATES DECAY====");
-            train(0.001f, NO_GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);
-            printf("====NO GATES NO DECAY====");
-            train(0.0f, NO_GATES, 0.0f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j]);    
+            printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[0]);
+            // printf("====GATES NO DECAY====\n");
+            train(0.0f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[1]);
+            // printf("====GATES DECAY====\n");
+            train(0.001f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[2]);
+            // printf("====NO GATES DECAY====\n");
+            train(0.001f, NO_GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[3]);
+            // printf("====NO GATES NO DECAY====\n");
+            train(0.0f, NO_GATES, 0.0f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[4]);    
         }
     }
     return 0;
