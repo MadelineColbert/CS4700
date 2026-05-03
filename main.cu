@@ -186,7 +186,7 @@ __global__ void l2_pruning(float* weights, float threshold, int neurons, int inp
     float thread_sum =0;
 
     for (int i = tid; i < inputs; i += blockDim.x){
-        float curr_w = weights[neuron + i * neurons]; 
+        float curr_w = weights[neuron + i * neurons];
         thread_sum += curr_w * curr_w;
     }
 
@@ -196,7 +196,7 @@ __global__ void l2_pruning(float* weights, float threshold, int neurons, int inp
 
     for (int tds = blockDim.x/2; tds > 0; tds/=2){
         if (tid < tds){
-            neuron_sums[tid] += neuron_sums[tid+tds]; 
+            neuron_sums[tid] += neuron_sums[tid+tds];
         }
         __syncthreads();
     }
@@ -335,17 +335,14 @@ void free_nn(NN* network){
 
 void free_optimized_nn(PostProcessedNN* optNet) {
     for (int l = 0; l < NUM_LAYERS; l++) {
-        // Shared Bias
         if (optNet->bias[l]) CUDA_CHECK(cudaFree(optNet->bias[l]));
 
         if (optNet->type[l] == LAYER_SPARSE) {
-            // Sparse-specific cleanup
             if (optNet->csrVal[l])    CUDA_CHECK(cudaFree(optNet->csrVal[l]));
             if (optNet->csrRowPtr[l]) CUDA_CHECK(cudaFree(optNet->csrRowPtr[l]));
             if (optNet->csrColInd[l]) CUDA_CHECK(cudaFree(optNet->csrColInd[l]));
             if (optNet->matDescr[l])  CUSPARSE_CHECK(cusparseDestroySpMat(optNet->matDescr[l]));
         } else {
-            // Dense-specific cleanup
             if (optNet->denseW[l])    CUDA_CHECK(cudaFree(optNet->denseW[l]));
         }
     }
@@ -389,7 +386,6 @@ void forward(NN* network, float* input, cublasHandle_t handle, Gates gate){
         add_bias<<<gridDim, blockDim>>>(network->pre_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
 
         if (l == NUM_LAYERS-1){
-            // This is bad for now, figure out later...
             int threads = 256;
             int blocks = (BATCH_SIZE + threads - 1) / threads;
             softmax_kernel<<<blocks, threads>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
@@ -409,7 +405,6 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
     dim3 grid_ce((network->layers[NUM_LAYERS] + block_ce.x - 1) / block_ce.x,
                 (BATCH_SIZE + block_ce.y - 1) / block_ce.y);
 
-    // Start by initializing with cross entropy loss (Divided by batch size is handled here)
     softmax_ce_kernel<<<grid_ce, block_ce>>>(network->post_act[NUM_LAYERS-1], labels, network->pre_grad[NUM_LAYERS-1], network->layers[NUM_LAYERS], BATCH_SIZE);
 
     for (int l=NUM_LAYERS-1; l>=0; l--){
@@ -460,7 +455,7 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
                             network->pre_grad[l], network->layers[l+1],
                         &zero, network->post_grad[l-1],   network->layers[l]));
             }
-           
+
 
 
             // Handle the ReLU activation gradient from pre-act to post-act
@@ -475,7 +470,7 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
 
         // SGD Parameter Update
         sgd_kernel<<<w_grid, block_256>>>(network->weights[l], network->w_grad[l], lr/(float)BATCH_SIZE, w_size, decay);
-        
+
         sgd_kernel<<<b_grid, block_256>>>(network->bias[l], network->b_grad[l], lr/(float)BATCH_SIZE, network->layers[l+1], decay);
     }
 }
@@ -499,7 +494,7 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
     for (int l = 0; l < NUM_LAYERS; l++) {
         int orig_in = oldNet->layers[l];
         int orig_out = oldNet->layers[l+1];
-        
+
         float* h_W = (float*)malloc(orig_in * orig_out * sizeof(float));
         float* h_b = (float*)malloc(orig_out * sizeof(float));
         CUDA_CHECK(cudaMemcpy(h_W, oldNet->weights[l], orig_in * orig_out * sizeof(float), cudaMemcpyDeviceToHost));
@@ -510,12 +505,15 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
         for (int r = 0; r < orig_out; r++) {
             bool is_dead = true;
             for (int c = 0; c < orig_in; c++) {
-                if (fabsf(h_W[c * orig_out + r]) > 1e-9f) {
+                if (h_W[c * orig_out + r] > 1e-9f || h_W[c * orig_out + r] < -1e-9f) {
                     is_dead = false;
                     break;
                 }
             }
-            if (!is_dead) live_indices[live_neurons++] = r;
+            if (!is_dead){
+                live_indices[live_neurons] = r;
+                live_neurons++;
+            }
         }
 
         optNet->in_dims[l] = orig_in;
@@ -531,7 +529,9 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
             for (int c = 0; c < orig_in; c++) {
                 float val = h_W[c * orig_out + original_row];
                 h_compactW[c * live_neurons + r_idx] = val;
-                if (fabsf(val) > 1e-9f) total_nnz++;
+                if (val > 1e-9f || val < -1e-9f) {
+                    total_nnz++;
+                }
             }
         }
 
@@ -554,7 +554,7 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
                 h_csrRowPtr[r] = curr_nnz;
                 for (int c = 0; c < orig_in; c++) {
                     float val = h_compactW[c * live_neurons + r];
-                    if (fabsf(val) > 1e-9f) {
+                    if (val > 1e-9f || val < -1e-9f) {
                         h_csrVal[curr_nnz] = val;
                         h_csrColInd[curr_nnz] = c;
                         curr_nnz++;
@@ -583,9 +583,14 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
 
 void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buffers, cublasHandle_t cbHandle, cusparseHandle_t spHandle) {
     float one = 1.0f, zero = 0.0f;
+    float* in;
 
     for (int l = 0; l < NUM_LAYERS; l++) {
-        float* in = (l == 0) ? d_input : act_buffers[l-1];
+        if (l == 0){
+            in = d_input;
+        } else{
+            in = act_buffer[l-1];
+        }
         float* out = act_buffers[l];
 
         if (optNet->type[l] == LAYER_DENSE) {
@@ -597,14 +602,14 @@ void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buff
             cusparseDnMatDescr_t matIn, matOut;
             cusparseCreateDnMat(&matIn, optNet->in_dims[l], BATCH_SIZE, optNet->in_dims[l], in, CUDA_R_32F, CUSPARSE_ORDER_COL);
             cusparseCreateDnMat(&matOut, optNet->out_dims[l], BATCH_SIZE, optNet->out_dims[l], out, CUDA_R_32F, CUSPARSE_ORDER_COL);
-            
+
             size_t bufSize = 0;
             cusparseSpMM_bufferSize(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &bufSize);
             void* d_buf; cudaMalloc(&d_buf, bufSize);
             cusparseSpMM(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
                          &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, d_buf);
-            
+
             cudaFree(d_buf);
             cusparseDestroyDnMat(matIn); cusparseDestroyDnMat(matOut);
         }
@@ -694,7 +699,6 @@ float compute_loss(const float* d_probs, const int* d_labels,
     for (int j = 0; j < BATCH_SIZE; j++) {
         int   c = h_labels[j];
         float p = h_probs[j * out_dim + c];
-        // Cross-Entropy Loss
         loss   -= logf(fmaxf(p, 1e-7f));
     }
 
@@ -725,7 +729,7 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
 
     for (int batch=0; batch < batches_per_iter; batch++){
         int offset = batch * BATCH_SIZE;
-        
+
         cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
 
         optimized_forward(network, d_images, opt_act_buffers, handle, spHandle);
@@ -733,7 +737,7 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
         float* h_outputs = (float*)malloc(BATCH_SIZE * network->out_dims[NUM_LAYERS-1] * sizeof(float));
 
         cudaMemcpy(h_outputs, opt_act_buffers[NUM_LAYERS-1], BATCH_SIZE * network->out_dims[NUM_LAYERS-1] * sizeof(float), cudaMemcpyDeviceToHost);
-        
+
         for(int image=0; image < BATCH_SIZE; image++){
             int image_offset = image * network->out_dims[NUM_LAYERS-1];
 
@@ -755,7 +759,7 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
         }
     }
 
-    float percentage = correct_pred_count / ((float) image_count) * 100.0f; 
+    float percentage = correct_pred_count / ((float) image_count) * 100.0f;
     printf("%d/%d (%.2f%%) correctly predicted\n", correct_pred_count, image_count, percentage);
 
     cudaFree(d_images);
@@ -818,7 +822,7 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
         }
 
         int batches_per_epoch = count/BATCH_SIZE;
-    
+
     struct timeval start, end;
     gettimeofday(&start, NULL);
 
@@ -826,8 +830,8 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
         for (int batch=0; batch < batches_per_epoch; batch++){
             // Since the batches per epoch is just integer division, we remove the remaining images.
             int offset = batch * BATCH_SIZE;
-            
-            // Add starting address so that 
+
+            // Add starting address so that
             cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
@@ -844,13 +848,13 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
     gettimeofday(&end, NULL);
     times[k] = ((double)(end.tv_sec - start.tv_sec) + (double)(end.tv_usec - start.tv_usec) / 1e6) * 1000.0;
     printf("Time taken: %.3f ms\n", times[k]);
-    
+
     post_processing(&network, threshold);
-    
+
     PostProcessedNN optNet;
-    
+
     convert_to_optimized(&network, &optNet, 0.3);
-    
+
     accuracies[k] = test_nn(&optNet, handle);
 
     free_optimized_nn(&optNet);
