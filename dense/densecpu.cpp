@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <math.h>
 #include "network.h"
+#include <chrono>
+#include <time.h>
 
 #define IMAGE_NEURONS 784
 #define LAYER_1 100
@@ -65,6 +66,11 @@ void free_input(float* images, int* labels, int count) {
     free(labels);
 }
 
+float lossCompute(int outputLayerDim, float* labels) {
+
+    return 1.0;
+}
+
 int main() {
     int* layerConfig = [IMAGE_NEURONS, LAYER_1, LAYER_2, LAYER_3, RESULT_LAYER];
 
@@ -76,8 +82,12 @@ int main() {
     int* labels = NULL;
     int count = 0;
 
+    int batches_per_epoch = BATCH_SIZE / EPOCHS;
+
+    // Load images into 
     load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 
+    auto start = std::chrono::steady_clock::now();
 
     // Train the neural network
     for (int iter = 0; iter < EPOCHS; iter++) {
@@ -86,15 +96,25 @@ int main() {
             int offset = batch * BATCH_SIZE;
 
             // Call forward pass
-            Network::forward()
+            Network::forward(&images);
 
             // Call backward pass
-            Network::backward()
+            Network::backward(&images);
 
             // Compute the loss func
+            float loss = lossCompute(RESULT_LAYER, &labels);
 
-                // Print accuracy...?
+            // Print accuracy...?
+            printf("Epoch %d  batch %d/%d  loss = %f\n", iter + 1, batch, batches_per_epoch, loss);
+            
         }
     }
+
+    auto end = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Time taken: %f\n" << duration.count() << "ms" << std::endl;
+
+    free(images);
+    free(labels);
 
 }
