@@ -11,10 +11,6 @@
 #define RESULT_LAYER 10
 
 
-double sigmoid(double x) {
-     return 1.0 / (1 + std::exp(-x));
-}
-
 /* Inspiration on how to load (especially the magic numbers)
 *  Was taken from https://github.com/projectgalateia/mnist/blob/master/mnist.h
 */
@@ -70,13 +66,32 @@ void free_input(float* images, int* labels, int count) {
 }
 
 int main() {
-    Network neuralNet;
+    int* layerConfig = [IMAGE_NEURONS, LAYER_1, LAYER_2, LAYER_3, RESULT_LAYER];
+    
+    // Init. the network
+    Network neuralNet = Network::Network(5, layerConfig);
 
-
-
+    // Prepare the dataset
     float* images = NULL;
     int* labels = NULL;
     int count = 0;
+
+    
+    // Train the neural network
+    for (int iter = 0; iter < EPOCHS; iter++) {
+        for (int batch = 0; batch < batches_per_epoch; batch++) {
+            // Since the batches per epoch is just integer division, we remove the remaining images.
+            int offset = batch * BATCH_SIZE;
+
+            // Call forward pass
+
+            // Call backward pass
+
+            // Compute the loss func
+
+            // Print accuracy...?
+        }
+    }
 
     load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 }

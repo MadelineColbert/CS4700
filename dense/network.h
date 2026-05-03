@@ -4,7 +4,7 @@
 #include <vector>
 #include <iostream>
 #include <cstdlib>
-#include <eigen>
+#include <eigen3/Eigen/Eigen>
 
 #define NUM_LAYERS 4
 
@@ -27,68 +27,78 @@ class Network
 public:
 	int layers[NUM_LAYERS];
 	
-	Network(int layerCount);
-	void forward(vector<float>* layer);
-	void backward(Network* network, float* inputLayer, float* outputLayer);
-	void softmax(RowVector* output);
+	Network(int layerCount, int* layerSizes);
+	void forward(RowVector* layer);
+	void backward(Network* network, float* inputLayer, float* outputLayer, RowVector* targetValues);
 	void relu(RowVector* output);
-	void updateWeight()
 
 private:
+	double sigmoid(float x);
 	
-	std::vector<RowVector*> neuronLayers;		// Store layers of neurons (vector of vectors)
+	std::vector<RowVector*> neuronLayers;		// Store layers of neurons (vector of vectors) w/ each vec. having the act. number.
+	std::vector<RowVector*> deltas;			// Error val vectors for layers
 	std::vector<Matrix*> weights;	// Store the connections
+	std::vector<Matrix*> gradient;	// Gradient to be applied during backprop. from error calculation
 };
 
 Network::Network(int layerCount, int* layerSizes) {
 
-
+	
 	for (int i = 0; i < layerCount; i++) {
-		// Add a new layer of neurons with a given size;
-		neuronLayers.push_back(new RowVector(layerSizes[i]);
+		layers = layerSizes[i];
+		// Add a new layer of neurons with a given size, and init at zero
+		neuronLayers.push_back(new RowVector::Zero(layerSizes[i]));
+		deltas.push_back(new RowVector(neuronLayers.size()));
 
 		// Add new matrix to keep track of weights for fully connected edges, but only between layers!
 		if (i > 0) {
-			weights.push_back(new Matrix(layerSize[i - 1] * layerSize[i]));
+			// Initialize new matrix for weights and have each element be a random number.
+			MatrixXf newWeightMatrix = MatrixXf::random(layerSizes[i - 1], layerSizes[i]);
+			weights.push_back(newWeightMatrix);
+			// Init the new weights with random values
 		}
-	}
-
-	// Randomization
-
-
-
+	}		
 }
 
-Network::forward(vector<float>* inputLayer) {
-	std::cout << "Yuh" << std::endl;
-
+Network::forward(RowVector* inputLayer)
+{
 	// For fully connected neurons, get each val from the prev. layer..?
 	float sum = 0.0f;
 
 	// Grab layer length from array in pub.
-	for (int i = 1; i < inputLayer.size(); i++) {
-		inputLayer[i] = inputLayer[i - 1] * this->weights[i - 1];
-		// Put relu func. ?
+	for (int i = 1; i < inputLayer.size(); i++) 
+	{		
+		(*inputLayer[i]) = sigmoid((*inputLayer[i - 1]) * (*weights[i - 1]));
+	}
+
+	relu(inputLayer);
+}
+
+// Use output vector as input!
+Network::relu(RowVector* input) 
+	{
+	for (int i = 0; i < input.size() - 1; i++) {
+		input[i] = std::max(0, input[i]);
 	}
 }
 
-Network::relu(RowVector* output) {
-
-	for (int i = 0; i < output.size() - 1; i++) {
-		output[i] = std::max(0, output[i]);
+Network::backward(Network* network, float* inputLayer, float* outputLayer, RowVector* targetValues) {
+	// Calculate the error and then update the weights going backwards. Recall that error is calculated on the last layer
+	
+	// Calculate error vector for ouput layer (last layer)
+	(*deltas.back()) = targetValues - (*neuronLayers.back());
+	
+	// Go back through the hidden layers and update weights based one error vector values
+	for (int i = layers[i] - 2; i > 0; i--) {
+		(*delta[i]) = (*delta[i + 1]) * (*weights[i + 1]);
 	}
 
+	// From there, compute the gradient going backwards
 }
 
-Network::backward(Network* network, float* inputLayer, float* outputLayer) {
-
-
+Network::sigmoid(float x) {
+	return 1 / (1 - expf(-x));
 }
-
-Network::softmax(RowVector* input) {
-
-}
-
 
 
 #endif
