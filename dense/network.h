@@ -9,7 +9,7 @@
 #define NUM_LAYERS 4
 
 #define BATCH_SIZE 1024
-#define STEP_SIZE 0.05
+#define STEP_SIZE 0.05 // LEARNING RATE
 #define EPOCHS 100
 
 
@@ -29,11 +29,12 @@ public:
 	
 	Network(int layerCount, int* layerSizes);
 	void forward(RowVector* layer);
-	void backward(Network* network, float* inputLayer, float* outputLayer, RowVector* targetValues);
+	void backward(float* inputLayer, RowVector* targetValues);
 	void relu(RowVector* output);
 
 private:
-	double sigmoid(float x);
+	float sigmoid(float x);
+	float sigmoidDerivative(float x);
 	
 	std::vector<RowVector*> neuronLayers;		// Store layers of neurons (vector of vectors) w/ each vec. having the act. number.
 	std::vector<RowVector*> deltas;			// Error val vectors for layers
@@ -60,10 +61,9 @@ Network::Network(int layerCount, int* layerSizes) {
 	}		
 }
 
-Network::forward(RowVector* inputLayer)
+void Network::forward(RowVector* inputLayer)
 {
 	// For fully connected neurons, get each val from the prev. layer..?
-	float sum = 0.0f;
 
 	// Grab layer length from array in pub.
 	for (int i = 1; i < inputLayer.size(); i++) 
@@ -75,30 +75,52 @@ Network::forward(RowVector* inputLayer)
 }
 
 // Use output vector as input!
-Network::relu(RowVector* input) 
+void Network::relu(RowVector* input) 
 	{
 	for (int i = 0; i < input.size() - 1; i++) {
 		input[i] = std::max(0, input[i]);
 	}
 }
 
-Network::backward(Network* network, float* inputLayer, float* outputLayer, RowVector* targetValues) {
+void Network::backward(float* inputLayer, RowVector* targetValues) {
 	// Calculate the error and then update the weights going backwards. Recall that error is calculated on the last layer
-	
+
 	// Calculate error vector for ouput layer (last layer)
-	(*deltas.back()) = targetValues - (*neuronLayers.back());
-	
-	// Go back through the hidden layers and update weights based one error vector values
-	for (int i = layers[i] - 2; i > 0; i--) {
-		(*delta[i]) = (*delta[i + 1]) * (*weights[i + 1]);
+	deltas.back() = *targetValues - neuronLayers.back();
+
+	// Go back through the hidden layers and update weights based on error vector values
+	for (int i = neuronLayers.size() - 2; i > 0; i--) {
+		(*delta[i]) = (*deltas[i + 1]) * (*weights[i + 1].transpose());
 	}
 
 	// From there, compute the gradient going backwards
-}
+	/*
+		Iterate over all neurons in each layer
+		Inside this loop, update the the weight matrix corresponding to the layer (double nested loop over matrix)
+	*/
+	for (int i = 0; i < weights.size() - 1; i++) {
 
-Network::sigmoid(float x) {
+		gradient[i] = (neuronLayers[i].transpose() * deltas[i + 1]);
+
+		for (int r = 0; r < weights[i]->rows(); r++) {
+			for (int c = 0; c < weights[i]->cols(); c++) {
+
+				float influence = sigmoidDerivative(gradient[i]->coeffRef(c));
+				weights.coeffRef(r, c) += (*deltas[i]->coeffRef(c)) * influence) * STEP_SIZE;
+
+			}
+		}
+	}
+}
+	
+
+// Use sigmoid for last layer
+float Network::sigmoid(float x) {
 	return 1 / (1 - expf(-x));
 }
 
+float Network::sigmoidDerivative(float x) {
+	return (sigmoid(x) * (1 - sigmoid(x));
+}
 
 #endif

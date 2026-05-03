@@ -67,7 +67,7 @@ void free_input(float* images, int* labels, int count) {
 
 int main() {
     int* layerConfig = [IMAGE_NEURONS, LAYER_1, LAYER_2, LAYER_3, RESULT_LAYER];
-    
+
     // Init. the network
     Network neuralNet = Network::Network(5, layerConfig);
 
@@ -76,7 +76,9 @@ int main() {
     int* labels = NULL;
     int count = 0;
 
-    
+    load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
+
+
     // Train the neural network
     for (int iter = 0; iter < EPOCHS; iter++) {
         for (int batch = 0; batch < batches_per_epoch; batch++) {
@@ -84,14 +86,15 @@ int main() {
             int offset = batch * BATCH_SIZE;
 
             // Call forward pass
+            Network::forward()
 
             // Call backward pass
+            Network::backward()
 
             // Compute the loss func
 
-            // Print accuracy...?
+                // Print accuracy...?
         }
     }
 
-    load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 }
