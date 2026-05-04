@@ -86,6 +86,7 @@ enum Gates{
     NO_GATES
 };
 
+// Element wise max with 0. Generally, the number of threads can be greater than the elements, so this works
 __global__ void relu_kernel(float* pre_act,
                             float* post_act,
                             int out_dim,
@@ -99,7 +100,7 @@ __global__ void relu_kernel(float* pre_act,
     }
 }
 
-// This is really bad for now. Figure this out later.
+// It is very specific to the 10 outputs, but it works
 __global__ void softmax_kernel(float* in, float* out, int length, int batch_size){
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= batch_size) return;
@@ -124,6 +125,7 @@ __global__ void softmax_kernel(float* in, float* out, int length, int batch_size
     }
 }
 
+// Add bias to each data point.
 __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
@@ -133,7 +135,8 @@ __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
     }
 }
 
-__global__ void regularization(float* params, float* g_grad, float* weights, float norm, float LR, int n){
+// Use regularization on the gate variables $\ell(W,b,g) + \lambda \|g\|$
+__global__ void g_regularization(float* params, float* g_grad, float* weights, float norm, float LR, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
         float final_g = g_grad[tid] * weights[tid];
@@ -147,17 +150,20 @@ __global__ void regularization(float* params, float* g_grad, float* weights, flo
     }
 }
 
+// Sum up the preactivations to update the biases
 __global__ void bias_grad_kernel(float* pre_act, float* bias, int out_dim, int batch){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= out_dim) return;
 
     float acc = 0.0f;
-    for (int col = 0; col < batch; col++)
+    for (int col = 0; col < batch; col++){
         acc += pre_act[col * out_dim + row];
+    }
     bias[row] = acc;
 }
 
-__global__ void softmax_ce_kernel(float* prob_out, int* labels, float* pre_grad, int out_dim, int batch){
+// Backwards kernel on softmax. Essentially, it is the difference between the predicted probability and where or not it is the actual label
+__global__ void softmax_backwards_kernel(float* prob_out, int* labels, float* pre_grad, int out_dim, int batch){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch){
@@ -172,8 +178,12 @@ __global__ void softmax_ce_kernel(float* prob_out, int* labels, float* pre_grad,
     }
 }
 
-__global__ void l2_pruning(float* weights, float threshold, int neurons, int inputs){
-    extern __shared__ float neuron_sums[];
+// Pruning neurons based on whether or not their L2-norm is below a certain threshold.
+__global__ void pruning(float* weights, float* g, int* total_nnzs, float threshold, int neurons, int inputs){
+    // https://forums.developer.nvidia.com/t/dynamic-shared-memory-allocation-of-more-than-one-array/23111/4
+    extern __shared__ char smem[];
+    float* neuron_sums = (float*)smem;
+    int*   nnz         = (int*)(smem + blockDim.x * sizeof(float));
 
     int neuron = blockIdx.x;
     int tid = threadIdx.x;
@@ -184,38 +194,54 @@ __global__ void l2_pruning(float* weights, float threshold, int neurons, int inp
 
     int starting_idx = neuron * inputs;
     float thread_sum =0;
+    int nnzs = 0;
 
     for (int i = tid; i < inputs; i += blockDim.x){
+        if ((g != NULL && g[neuron + i * neurons] < 0.5) || (weights[neuron + i * neurons] < 1e-4f && weights[neuron + i * neurons] > -1e-4f)){
+            weights[neuron + i * neurons] = 0;
+        }
+
+        if ((weights[neuron + i * neurons] > 1e-4f || weights[neuron + i * neurons] < -1e-4f)) {
+            nnzs++;
+        }
         float curr_w = weights[neuron + i * neurons];
         thread_sum += curr_w * curr_w;
     }
 
-
+    // Optimized summing of the neuron sums
     neuron_sums[tid] = thread_sum;
+    nnz[tid] = nnzs;
     __syncthreads();
 
     for (int tds = blockDim.x/2; tds > 0; tds/=2){
         if (tid < tds){
             neuron_sums[tid] += neuron_sums[tid+tds];
+            nnz[tid] += nnz[tid+tds];
         }
         __syncthreads();
     }
 
+    // Calculate whether or not to prune
     __shared__ bool prune;
     if (tid == 0){
         float l2_norm = sqrtf(neuron_sums[0]);
         prune = (l2_norm < threshold);
+        if (prune) {
+            nnz[0] = 0;
+        }
+        total_nnzs[neuron] = nnz[0];
     }
 
     __syncthreads();
 
     if (prune) {
-        for (int i=tid; i < inputs; i++){
+        for (int i=tid; i < inputs; i+=blockDim.x){
             weights[neuron + i * neurons] = 0;
         }
     }
 }
 
+// Gradient is identity if relu is active and 0 if it is not.
 __global__ void relu_backward_kernel(const float* grad_out,
                                      const float* pre_act,
                                      float* grad_in,
@@ -225,10 +251,15 @@ __global__ void relu_backward_kernel(const float* grad_out,
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch) {
         int idx = col * out_dim + row;
-        grad_in[idx] = grad_out[idx] * (pre_act[idx] > 0.0f ? 1.0f : 0.0f);
+        if (pre_act[idx] > 0.0f){
+            grad_in[idx] = grad_out[idx];
+        } else{
+            grad_in[idx] = 0.0f;
+        }
     }
 }
 
+// Updating the the weights via SGD with a weight decay and a Learning Rate
 __global__ void sgd_kernel(float* params, float* grad, float LR, int n, float decay){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
@@ -236,6 +267,7 @@ __global__ void sgd_kernel(float* params, float* grad, float LR, int n, float de
     }
 }
 
+// At the end of training, if our gate's ML draw is inactive, disable it.
 __global__ void remove_gates(float* weights, float* g, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
@@ -245,6 +277,7 @@ __global__ void remove_gates(float* weights, float* g, int n){
     }
 }
 
+// Component wise multiplication of the weight and whether the gate is open or closed
 __global__ void gate_mult(float* weights, float* g, float* post_g, int in, int out ){
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
@@ -258,6 +291,7 @@ __global__ void gate_mult(float* weights, float* g, float* post_g, int in, int o
     }
 }
 
+// Update the gradients of the weights based on whether or not they contributed to the output.
 __global__ void mask_w_grad(float* w_grad, float* g, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
@@ -267,35 +301,44 @@ __global__ void mask_w_grad(float* w_grad, float* g, int n){
     }
 }
 
-void init_nn(NN* network) {
+// Initializing the neural network based on a xavier uniform (works and is less complex to implement than xavier normal)
+// Also initializing the gates as mostly open
+void init_train_nn(NN* network, Gates gate) {
     for (int l = 0; l < NUM_LAYERS; l++) {
         int in_dim  = network->layers[l];
         int out_dim = network->layers[l + 1];
+        float* g = NULL;
 
         float xavier_init = sqrtf(6.0f/(in_dim+out_dim));
 
         float* h_W = (float*)calloc(in_dim * out_dim, sizeof(float));
-        float* g = (float*)calloc(in_dim * out_dim, sizeof(float));
+        if(gate == GATES){
+            g = (float*)calloc(in_dim * out_dim, sizeof(float));
+        }
         float* h_b = (float*)calloc(out_dim, sizeof(float));
         srand(time(NULL));
         for (int i=0; i<in_dim*out_dim; i++){
           h_W[i] = ((float)rand() / (float)RAND_MAX) * 2 * xavier_init - xavier_init;
-          g[i] = 0.9f + 0.1f * ((float)rand() / (float)RAND_MAX);
+          if(gate == GATES && g != NULL){
+            g[i] = 0.9f + 0.1f * ((float)rand() / (float)RAND_MAX);
+          }
         }
         CUDA_CHECK(cudaMemcpy(network->weights[l], h_W, in_dim * out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(network->bias[l], h_b, out_dim * sizeof(float),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(network->g[l], g, in_dim * out_dim * sizeof(float),
-                              cudaMemcpyHostToDevice));
         free(h_W);
         free(h_b);
-        free(g);
+        if(gate == GATES){
+            CUDA_CHECK(cudaMemcpy(network->g[l], g, in_dim * out_dim * sizeof(float),
+                                cudaMemcpyHostToDevice));
+            free(g);
+        }
     }
 }
 
-
-void define_nn(NN* network){
+// Malloc all of the layers that are needed.
+void define_train_nn(NN* network, Gates gate){
     for (int l=0; l< NUM_LAYERS; l++){
         int in_dim  = network->layers[l];
         int out_dim = network->layers[l + 1];
@@ -306,16 +349,19 @@ void define_nn(NN* network){
         CUDA_CHECK(cudaMalloc(&network->pre_act[l], BATCH_SIZE*out_dim*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&network->pre_grad[l], BATCH_SIZE*out_dim*sizeof(float)));
 
-        CUDA_CHECK(cudaMalloc(&network->g[l], in_dim*out_dim*sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&network->g_grad[l], in_dim*out_dim*sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&network->post_g[l], in_dim*out_dim*sizeof(float)));
+        if (gate == GATES){
+            CUDA_CHECK(cudaMalloc(&network->g[l], in_dim*out_dim*sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&network->g_grad[l], in_dim*out_dim*sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&network->post_g[l], in_dim*out_dim*sizeof(float)));
+        }
 
         CUDA_CHECK(cudaMalloc(&network->post_grad[l], BATCH_SIZE*out_dim*sizeof(float)));
         CUDA_CHECK(cudaMalloc(&network->post_act[l], BATCH_SIZE*out_dim*sizeof(float)));
     }
 }
 
-void free_nn(NN* network){
+// Free all of the neural network layers
+void free_train_nn(NN* network, Gates gate){
     for (int l=0; l< NUM_LAYERS; l++){
         CUDA_CHECK(cudaFree(network->weights[l]));
         CUDA_CHECK(cudaFree(network->bias[l]));
@@ -323,9 +369,11 @@ void free_nn(NN* network){
         CUDA_CHECK(cudaFree(network->post_act[l]));
         CUDA_CHECK(cudaFree(network->b_grad[l]));
 
-        CUDA_CHECK(cudaFree(network->g[l]));
-        CUDA_CHECK(cudaFree(network->g_grad[l]));
-        CUDA_CHECK(cudaFree(network->post_g[l]));
+        if (gate == GATES){
+            CUDA_CHECK(cudaFree(network->g[l]));
+            CUDA_CHECK(cudaFree(network->g_grad[l]));
+            CUDA_CHECK(cudaFree(network->post_g[l]));
+        }
 
         CUDA_CHECK(cudaFree(network->pre_grad[l]));
         CUDA_CHECK(cudaFree(network->post_grad[l]));
@@ -333,6 +381,12 @@ void free_nn(NN* network){
     }
 }
 
+void free_input(float* images, int* labels){
+    free(images);
+    free(labels);
+}
+
+// Free the optimized neural network
 void free_optimized_nn(PostProcessedNN* optNet) {
     for (int l = 0; l < NUM_LAYERS; l++) {
         if (optNet->bias[l]) CUDA_CHECK(cudaFree(optNet->bias[l]));
@@ -348,6 +402,7 @@ void free_optimized_nn(PostProcessedNN* optNet) {
     }
 }
 
+// Forward pass of our neural network
 void forward(NN* network, float* input, cublasHandle_t handle, Gates gate){
     float one = 1.0f;
     float zero= 0.0f;
@@ -386,9 +441,9 @@ void forward(NN* network, float* input, cublasHandle_t handle, Gates gate){
         add_bias<<<gridDim, blockDim>>>(network->pre_act[l], network->bias[l], network->layers[l+1], BATCH_SIZE);
 
         if (l == NUM_LAYERS-1){
-            int threads = 256;
-            int blocks = (BATCH_SIZE + threads - 1) / threads;
-            softmax_kernel<<<blocks, threads>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
+            int sftmax_threads = 256;
+            int sftmax_blocks = (BATCH_SIZE + sftmax_threads - 1) / sftmax_threads;
+            softmax_kernel<<<sftmax_blocks, sftmax_threads>>>(network->pre_act[l], network->post_act[l], network->layers[l+1], BATCH_SIZE);
         } else {
             relu_kernel<<<gridDim, blockDim>>>(network->pre_act[l], network->post_act[l],network->layers[l+1], BATCH_SIZE);
         }
@@ -401,11 +456,11 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
     float* in;
 
     dim3 block_256(256);
-    dim3 block_ce(16, 16);
-    dim3 grid_ce((network->layers[NUM_LAYERS] + block_ce.x - 1) / block_ce.x,
-                (BATCH_SIZE + block_ce.y - 1) / block_ce.y);
+    dim3 block_sftmax_back(16, 16);
+    dim3 grid_sftmax_back((network->layers[NUM_LAYERS] + block_sftmax_back.x - 1) / block_sftmax_back.x,
+                (BATCH_SIZE + block_sftmax_back.y - 1) / block_sftmax_back.y);
 
-    softmax_ce_kernel<<<grid_ce, block_ce>>>(network->post_act[NUM_LAYERS-1], labels, network->pre_grad[NUM_LAYERS-1], network->layers[NUM_LAYERS], BATCH_SIZE);
+    softmax_backwards_kernel<<<grid_sftmax_back, block_sftmax_back>>>(network->post_act[NUM_LAYERS-1], labels, network->pre_grad[NUM_LAYERS-1], network->layers[NUM_LAYERS], BATCH_SIZE);
 
     for (int l=NUM_LAYERS-1; l>=0; l--){
         int w_size = network->layers[l] * network->layers[l+1];
@@ -426,7 +481,7 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
                                 network->w_grad[l], network->layers[l+1]));
 
         if (gate == GATES){
-            regularization<<<w_grid, block_256>>>(network->g[l], network->w_grad[l], network->weights[l], lamb, lr/(float)BATCH_SIZE, w_size);
+            g_regularization<<<w_grid, block_256>>>(network->g[l], network->w_grad[l], network->weights[l], lamb, lr/(float)BATCH_SIZE, w_size);
             mask_w_grad<<<w_grid, block_256>>>(network->w_grad[l], network->g[l], w_size);
         }
 
@@ -475,18 +530,7 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
     }
 }
 
-void post_processing(NN* network, float threshold){
-    for (int l =0; l < NUM_LAYERS; l++){
-
-        int threads = 256;
-        int blocks = ((network->layers[l] * network->layers[l+1]) + threads - 1) / threads;
-        remove_gates<<<blocks, threads>>>(network->weights[l], network->g[l], network->layers[l] * network->layers[l+1]);
-
-        l2_pruning<<<network->layers[l+1], 256, 256 * sizeof(float)>>>(
-            network->weights[l], threshold, network->layers[l+1], network->layers[l]);
-    }
-}
-
+// Move most of this to GPU
 void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutoff) {
     cusparseHandle_t spHandle;
     CUSPARSE_CHECK(cusparseCreate(&spHandle));
@@ -581,6 +625,28 @@ void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutof
     cusparseDestroy(spHandle);
 }
 
+void post_processing(NN* network, float threshold, float dense_cutoff, PostProcessedNN* optNet, Gates gate){
+    float *g_tmp;
+    for (int l =0; l < NUM_LAYERS; l++){
+
+        // Keep nnz, non-pruned
+        int* nnzs;
+        cudaMalloc(&nnzs, sizeof(int)*network->layers[l+1]);
+
+        if (gate == GATES){
+            g_tmp = network->g[l];
+        } else{
+            g_tmp = NULL;
+        }
+
+        pruning<<<network->layers[l+1], 256, 256 * (sizeof(float) + sizeof(int))>>>(
+            network->weights[l], g_tmp, nnzs, threshold, network->layers[l+1], network->layers[l]);
+
+        cudaFree(nnzs);
+    }
+    convert_to_optimized(network, optNet, dense_cutoff);
+}
+
 void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buffers, cublasHandle_t cbHandle, cusparseHandle_t spHandle) {
     float one = 1.0f, zero = 0.0f;
     float* in;
@@ -589,7 +655,7 @@ void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buff
         if (l == 0){
             in = d_input;
         } else{
-            in = act_buffer[l-1];
+            in = act_buffers[l-1];
         }
         float* out = act_buffers[l];
 
@@ -616,8 +682,12 @@ void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buff
 
         dim3 block(16, 16), grid((optNet->out_dims[l] + 15)/16, (BATCH_SIZE + 15)/16);
         add_bias<<<grid, block>>>(out, optNet->bias[l], optNet->out_dims[l], BATCH_SIZE);
-        if (l == NUM_LAYERS-1) softmax_kernel<<<(BATCH_SIZE+255)/256, 256>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
-        else relu_kernel<<<grid, block>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
+        if (l == NUM_LAYERS-1) {
+            softmax_kernel<<<(BATCH_SIZE+255)/256, 256>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
+        }
+        else {
+            relu_kernel<<<grid, block>>>(out, out, optNet->out_dims[l], BATCH_SIZE);
+        }
     }
 }
 
@@ -676,11 +746,6 @@ void load_mnist(char* image_file, char* label_file, float** images, int** labels
 
     fclose(ifp);
     fclose(lfp);
-}
-
-void free_input(float* images, int* labels, int count){
-    free(images);
-    free(labels);
 }
 
 float compute_loss(const float* d_probs, const int* d_labels,
@@ -763,7 +828,7 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     printf("%d/%d (%.2f%%) correctly predicted\n", correct_pred_count, image_count, percentage);
 
     cudaFree(d_images);
-    free_input(images, labels, image_count);
+    free_input(images, labels);
 
     for (int l = 0; l < NUM_LAYERS; l++) {
         CUDA_CHECK(cudaFree(opt_act_buffers[l]));
@@ -773,25 +838,27 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     return percentage;
 }
 
-void log_result(float step_size, int internal_size, const char* mode, float acc, double time) {
+void log_result(float step_size, int internal_size, const char* mode, float acc, double time, int nnzs, double test_times, float threshold, float decay, float regularizer) {
     FILE* f = fopen("results.csv", "a");
 
     fseek(f, 0, SEEK_END);
     if (ftell(f) == 0) {
-        fprintf(f, "step_size,internal_size,mode,accuracy,time\n");
+        fprintf(f, "step_size,internal_size,mode,accuracy,time,nnzs,test_time,threshold,decay,regularizer\n");
     }
 
-    fprintf(f, "%.6f,%d,%s,%.4f,%.4f\n", step_size, internal_size, mode, acc, time);
+    fprintf(f, "%.6f,%d,%s,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%.4f\n", step_size, internal_size, mode, acc, time, nnzs, test_times, threshold, decay, regularizer);
 
     fclose(f);
 }
 
-void train(float decay, Gates gate, float threshold, float lamb, float lr, int INTERNAL_LAYER_SIZE, const char* mode_name){
-  printf("====%s====\n",mode_name);
-  float* accuracies = (float*)malloc(sizeof(float) * ITERATIONS);
-  double* times = (double*)malloc(sizeof(double) * ITERATIONS);
-  for(int k=0; k<ITERATIONS; k++){
-    printf("Iteration %d:\n",k);
+void training_round(float decay, Gates gate, float threshold, float lamb, float lr, int INTERNAL_LAYER_SIZE, const char* mode_name){
+    printf("====%s====\n",mode_name);
+    float* accuracies = (float*)malloc(sizeof(float) * ITERATIONS);
+    double* times = (double*)malloc(sizeof(double) * ITERATIONS);
+    double* test_times = (double*)malloc(sizeof(double) * ITERATIONS);
+    int nnzs = 0;
+    for(int k=0; k<ITERATIONS; k++){
+        printf("Iteration %d:\n",k);
         NN network;
         cublasHandle_t handle;
         network.layers[0] = IMAGE_LENGTH * IMAGE_LENGTH;
@@ -805,98 +872,109 @@ void train(float decay, Gates gate, float threshold, float lamb, float lr, int I
 
         load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 
-        define_nn(&network);
+        define_train_nn(&network, gate);
 
-        init_nn(&network);
+        init_train_nn(&network, gate);
 
-    float* d_images;
-    CUDA_CHECK(cudaMalloc(&d_images, IMAGE_LENGTH*IMAGE_LENGTH * BATCH_SIZE * sizeof(float)));
+        float* d_images;
+        CUDA_CHECK(cudaMalloc(&d_images, IMAGE_LENGTH*IMAGE_LENGTH * BATCH_SIZE * sizeof(float)));
 
-    int* d_labels;
-    CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
+        int* d_labels;
+        CUDA_CHECK(cudaMalloc(&d_labels, BATCH_SIZE*sizeof(int)));
 
-        cublasStatus_t state = cublasCreate(&handle);
-
-        if (state != CUBLAS_STATUS_SUCCESS){
-            printf("HANDLE CREATION");
-        }
+        cublasCreate(&handle);
 
         int batches_per_epoch = count/BATCH_SIZE;
 
-    struct timeval start, end;
-    gettimeofday(&start, NULL);
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
 
-    for (int iter=0; iter < EPOCHS; iter++){
-        for (int batch=0; batch < batches_per_epoch; batch++){
-            // Since the batches per epoch is just integer division, we remove the remaining images.
-            int offset = batch * BATCH_SIZE;
+        for (int iter=0; iter < EPOCHS; iter++){
+            for (int batch=0; batch < batches_per_epoch; batch++){
+                // Since the batches per epoch is just integer division, we remove the remaining images.
+                int offset = batch * BATCH_SIZE;
 
-            // Add starting address so that
-            cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_labels, &labels[offset], BATCH_SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
-            forward(&network, d_images, handle, gate);
-            backward(&network, d_images, d_labels, handle, decay, gate, lamb, lr);
-            float loss = compute_loss(
-                        network.post_act[NUM_LAYERS - 1],
-                        d_labels,
-                        network.layers[NUM_LAYERS]);
-            //printf("Epoch %d  batch %d/%d  loss = %f\n", iter + 1, batch, batches_per_epoch, loss);
+                forward(&network, d_images, handle, gate);
+                backward(&network, d_images, d_labels, handle, decay, gate, lamb, lr);
+                float loss = compute_loss(
+                            network.post_act[NUM_LAYERS - 1],
+                            d_labels,
+                            network.layers[NUM_LAYERS]);
+                //printf("Epoch %d  batch %d/%d  loss = %f\n", iter + 1, batch, batches_per_epoch, loss);
+            }
         }
-    }
 
-    gettimeofday(&end, NULL);
-    times[k] = ((double)(end.tv_sec - start.tv_sec) + (double)(end.tv_usec - start.tv_usec) / 1e6) * 1000.0;
-    printf("Time taken: %.3f ms\n", times[k]);
+        gettimeofday(&end, NULL);
+        times[k] = ((double)(end.tv_sec - start.tv_sec) + (double)(end.tv_usec - start.tv_usec) / 1e6) * 1000.0;
+        printf("Time taken: %.3f ms\n", times[k]);
 
-    post_processing(&network, threshold);
+        PostProcessedNN optNet;
 
-    PostProcessedNN optNet;
+        post_processing(&network, threshold, 0.3, &optNet, gate);
 
-    convert_to_optimized(&network, &optNet, 0.3);
+        gettimeofday(&start, NULL);
 
-    accuracies[k] = test_nn(&optNet, handle);
+        accuracies[k] = test_nn(&optNet, handle);
 
-    free_optimized_nn(&optNet);
+        gettimeofday(&end, NULL);
+        test_times[k] = ((double)(end.tv_sec - start.tv_sec) + (double)(end.tv_usec - start.tv_usec) / 1e6) * 1000.0;
 
-    free_nn(&network);
-    cudaFree(d_images);
-    cudaFree(d_labels);
-    cublasDestroy(handle);
+        for (int l =0; l < NUM_LAYERS; l++){
+            nnzs += optNet.nnz[l];
+        }
 
-    free_input(images, labels, count);
+        free_optimized_nn(&optNet);
+
+        free_train_nn(&network, gate);
+        cudaFree(d_images);
+        cudaFree(d_labels);
+        cublasDestroy(handle);
+
+        free_input(images, labels);
+
     }
 
     float accuracy_sum = 0;
     double time_sum = 0;
+    double test_time_sum = 0;
     for(int k=0; k<ITERATIONS; k++){
         accuracy_sum += accuracies[k];
         time_sum += times[k];
+        test_time_sum += test_times[k];
     }
     float average_accuracy = accuracy_sum / ITERATIONS;
-    double average_time = timeSum/ITERATIONS;
-    log_result(lr, INTERNAL_LAYER_SIZE, mode_name, average_accuracy, average_time);
+    double average_time = time_sum/ITERATIONS;
+    log_result(lr, INTERNAL_LAYER_SIZE, mode_name, average_accuracy, average_time, nnzs/3, test_time_sum, threshold, decay, lamb);
     printf("Average Accuracy: %.2f%%\n", average_accuracy);
     printf("Average Time: %.3f ms\n", average_time);
     free(accuracies);
     free(times);
+    free(test_times);
 }
 
 int main() {
     static const float STEP_SIZES[] = {0.025f, 0.05f, 0.075f};
+    static const float THRESHOLDS[] = {0.1f, 0.5f, 0.0f};
+    static const float DECAY[] = {0.0f, 0.001f, 0.01f};
+    static const float REGULARIZATION[] = {0.2f, 0.15f, 0.25f};
     static const int INTERNAL_SIZES[] = {128, 256, 512};
-    static const char* MODE_NAMES[] = {"GATES NO DECAY","GATES DECAY","NO GATES DECAY","NO GATES NO DECAY"};
+    static const char* MODE_NAMES[] = {"GATES","NO GATES"};
     for(int i=0; i<3; i++){
         for(int j=0; j<3; j++){
-            printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[0]);
-            // printf("====GATES NO DECAY====\n");
-            train(0.0f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[1]);
-            // printf("====GATES DECAY====\n");
-            train(0.001f, GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[2]);
-            // printf("====NO GATES DECAY====\n");
-            train(0.001f, NO_GATES, 0.5f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[3]);
-            // printf("====NO GATES NO DECAY====\n");
-            train(0.0f, NO_GATES, 0.0f, 0.01f, STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[4]);    
+            for(int k=0; k<3; j++){
+                for(int l=0; l<3; l++){
+                    for (int m=0; m<3; m++){
+                        printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j]);
+                        // printf("====GATES NO====\n");
+                        training_round(DECAY[l], GATES, THRESHOLDS[k], REGULARIZATION[m], STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[0]);
+                        // printf("====NO GATES====\n");
+                        training_round(DECAY[l], NO_GATES, THRESHOLDS[k], REGULARIZATION[m], STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[1]);
+                    }
+                }
+            }
         }
     }
     return 0;
