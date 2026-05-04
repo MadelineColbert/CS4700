@@ -12,6 +12,17 @@
 #define RESULT_LAYER 10
 
 
+// This + free_input() are from the .cu
+int mnist_bin_to_int(char* v) {
+    int i;
+    int ret = 0;
+    for (i = 0; i < 4; i++) {
+        ret <<= 8;
+        ret |= (unsigned char)v[i];
+    }
+    return ret;
+}
+
 /* Inspiration on how to load (especially the magic numbers)
 *  Was taken from https://github.com/projectgalateia/mnist/blob/master/mnist.h
 */
@@ -66,16 +77,16 @@ void free_input(float* images, int* labels, int count) {
     free(labels);
 }
 
-float lossCompute(int outputLayerDim, float* labels) {
-
+// May not need this...?
+float lossCompute(int outputLayerDim, int* labels) {
     return 1.0;
 }
 
 int main() {
-    int* layerConfig = [IMAGE_NEURONS, LAYER_1, LAYER_2, LAYER_3, RESULT_LAYER];
+    int layerConfig[] = {IMAGE_NEURONS, LAYER_1, LAYER_2, LAYER_3, RESULT_LAYER};
 
     // Init. the network
-    Network neuralNet = Network::Network(5, layerConfig);
+    Network* neuralNet = &Network::Network(5, layerConfig);
 
     // Prepare the dataset
     float* images = NULL;
@@ -87,8 +98,13 @@ int main() {
     // Load images into 
     load_mnist("train-images-idx3-ubyte", "train-labels-idx1-ubyte", &images, &labels, &count);
 
-    auto start = std::chrono::steady_clock::now();
 
+    // Load image array into a row vector type
+    RowVector imageInput = Eigen::Map<RowVector>(images, count);
+    
+
+
+    auto start = std::chrono::steady_clock::now();
     // Train the neural network
     for (int iter = 0; iter < EPOCHS; iter++) {
         for (int batch = 0; batch < batches_per_epoch; batch++) {
@@ -96,13 +112,13 @@ int main() {
             int offset = batch * BATCH_SIZE;
 
             // Call forward pass
-            Network::forward(&images);
+            neuralNet->forward(&imageInput);
 
             // Call backward pass
-            Network::backward(&images);
+            neuralNet->backward(&imageInput);
 
             // Compute the loss func
-            float loss = lossCompute(RESULT_LAYER, &labels);
+            float loss = lossCompute(RESULT_LAYER, labels);
 
             // Print accuracy...?
             printf("Epoch %d  batch %d/%d  loss = %f\n", iter + 1, batch, batches_per_epoch, loss);
