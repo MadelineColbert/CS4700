@@ -5,7 +5,6 @@
 #include <sys/time.h>
 #include "cuda_runtime.h"
 #include "cublas_v2.h"
-#include <cusparse.h>
 
 
 #define CUDA_CHECK(call)                                                  \
@@ -23,16 +22,6 @@
         cublasStatus_t _s = (call);                                       \
         if (_s != CUBLAS_STATUS_SUCCESS) {                                \
             fprintf(stderr, "cuBLAS error %s:%d — code %d\n",            \
-                    __FILE__, __LINE__, (int)_s);                         \
-            exit(EXIT_FAILURE);                                           \
-        }                                                                 \
-    } while (0)
-
-#define CUSPARSE_CHECK(call)                                              \
-    do {                                                                  \
-        cusparseStatus_t _s = (call);                                     \
-        if (_s != CUSPARSE_STATUS_SUCCESS) {                              \
-            fprintf(stderr, "cuSPARSE error %s:%d — code %d\n",           \
                     __FILE__, __LINE__, (int)_s);                         \
             exit(EXIT_FAILURE);                                           \
         }                                                                 \
@@ -66,13 +55,6 @@ typedef struct{
 typedef enum { LAYER_SPARSE, LAYER_DENSE } LayerType;
 
 typedef struct {
-    LayerType type[NUM_LAYERS];
-
-    float *csrVal[NUM_LAYERS];
-    int *csrRowPtr[NUM_LAYERS];
-    int *csrColInd[NUM_LAYERS];
-    cusparseSpMatDescr_t matDescr[NUM_LAYERS];
-
     float *denseW[NUM_LAYERS];
 
     float *bias[NUM_LAYERS];
@@ -389,15 +371,11 @@ void free_input(float* images, int* labels){
 // Free the optimized neural network
 void free_optimized_nn(PostProcessedNN* optNet) {
     for (int l = 0; l < NUM_LAYERS; l++) {
-        if (optNet->bias[l]) CUDA_CHECK(cudaFree(optNet->bias[l]));
-
-        if (optNet->type[l] == LAYER_SPARSE) {
-            if (optNet->csrVal[l])    CUDA_CHECK(cudaFree(optNet->csrVal[l]));
-            if (optNet->csrRowPtr[l]) CUDA_CHECK(cudaFree(optNet->csrRowPtr[l]));
-            if (optNet->csrColInd[l]) CUDA_CHECK(cudaFree(optNet->csrColInd[l]));
-            if (optNet->matDescr[l])  CUSPARSE_CHECK(cusparseDestroySpMat(optNet->matDescr[l]));
-        } else {
-            if (optNet->denseW[l])    CUDA_CHECK(cudaFree(optNet->denseW[l]));
+        if (optNet->bias[l]){
+            CUDA_CHECK(cudaFree(optNet->bias[l]));
+        }
+        if (optNet->denseW[l])    {
+            CUDA_CHECK(cudaFree(optNet->denseW[l]));
         }
     }
 }
@@ -530,107 +508,79 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
     }
 }
 
-// Move most of this to GPU
-void convert_to_optimized(NN* oldNet, PostProcessedNN* optNet, float dense_cutoff) {
-    cusparseHandle_t spHandle;
-    CUSPARSE_CHECK(cusparseCreate(&spHandle));
+int convert_to_optimized_2(PostProcessedNN* optNet, int orig_in, int orig_out, float* weights, float* biases, int* nnzs, int* prev_live_indices, int prev_live_neurons, int l, int** out_live_indices, int* out_live_neurons) {
+    float* h_W = (float*)malloc(orig_in * orig_out * sizeof(float));
+    float* h_b = (float*)malloc(orig_out * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(h_W, weights, orig_in * orig_out * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b, biases, orig_out * sizeof(float), cudaMemcpyDeviceToHost));
 
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        int orig_in = oldNet->layers[l];
-        int orig_out = oldNet->layers[l+1];
+    int live_neurons = 0;
+    int total_nnz = 0;
 
-        float* h_W = (float*)malloc(orig_in * orig_out * sizeof(float));
-        float* h_b = (float*)malloc(orig_out * sizeof(float));
-        CUDA_CHECK(cudaMemcpy(h_W, oldNet->weights[l], orig_in * orig_out * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_b, oldNet->bias[l], orig_out * sizeof(float), cudaMemcpyDeviceToHost));
-
-        int live_neurons = 0;
-        int* live_indices = (int*)malloc(orig_out * sizeof(int));
-        for (int r = 0; r < orig_out; r++) {
-            bool is_dead = true;
-            for (int c = 0; c < orig_in; c++) {
-                if (h_W[c * orig_out + r] > 1e-9f || h_W[c * orig_out + r] < -1e-9f) {
-                    is_dead = false;
-                    break;
-                }
-            }
-            if (!is_dead){
-                live_indices[live_neurons] = r;
-                live_neurons++;
-            }
+    int* live_indices = (int*)malloc(orig_out * sizeof(int));
+    for (int r = 0; r < orig_out; r++) {
+        if (nnzs[r] != 0){
+            live_indices[live_neurons] = r;
+            live_neurons++;
+            total_nnz += nnzs[r];
         }
-
-        optNet->in_dims[l] = orig_in;
-        optNet->out_dims[l] = live_neurons;
-
-        float* h_compactW = (float*)malloc(orig_in * live_neurons * sizeof(float));
-        float* h_compactB = (float*)malloc(live_neurons * sizeof(float));
-        int total_nnz = 0;
-
-        for (int r_idx = 0; r_idx < live_neurons; r_idx++) {
-            int original_row = live_indices[r_idx];
-            h_compactB[r_idx] = h_b[original_row];
-            for (int c = 0; c < orig_in; c++) {
-                float val = h_W[c * orig_out + original_row];
-                h_compactW[c * live_neurons + r_idx] = val;
-                if (val > 1e-9f || val < -1e-9f) {
-                    total_nnz++;
-                }
-            }
-        }
-
-        float density = (float)total_nnz / (orig_in * live_neurons);
-        optNet->nnz[l] = total_nnz;
-        CUDA_CHECK(cudaMalloc(&optNet->bias[l], live_neurons * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(optNet->bias[l], h_compactB, live_neurons * sizeof(float), cudaMemcpyHostToDevice));
-
-        if (density > dense_cutoff) {
-            optNet->type[l] = LAYER_DENSE;
-            CUDA_CHECK(cudaMalloc(&optNet->denseW[l], orig_in * live_neurons * sizeof(float)));
-            CUDA_CHECK(cudaMemcpy(optNet->denseW[l], h_compactW, orig_in * live_neurons * sizeof(float), cudaMemcpyHostToDevice));
-        } else {
-            optNet->type[l] = LAYER_SPARSE;
-            float* h_csrVal = (float*)malloc(total_nnz * sizeof(float));
-            int* h_csrColInd = (int*)malloc(total_nnz * sizeof(int));
-            int* h_csrRowPtr = (int*)malloc((live_neurons + 1) * sizeof(int));
-            int curr_nnz = 0;
-            for (int r = 0; r < live_neurons; r++) {
-                h_csrRowPtr[r] = curr_nnz;
-                for (int c = 0; c < orig_in; c++) {
-                    float val = h_compactW[c * live_neurons + r];
-                    if (val > 1e-9f || val < -1e-9f) {
-                        h_csrVal[curr_nnz] = val;
-                        h_csrColInd[curr_nnz] = c;
-                        curr_nnz++;
-                    }
-                }
-            }
-            h_csrRowPtr[live_neurons] = curr_nnz;
-
-            CUDA_CHECK(cudaMalloc(&optNet->csrVal[l], total_nnz * sizeof(float)));
-            CUDA_CHECK(cudaMalloc(&optNet->csrColInd[l], total_nnz * sizeof(int)));
-            CUDA_CHECK(cudaMalloc(&optNet->csrRowPtr[l], (live_neurons + 1) * sizeof(int)));
-            CUDA_CHECK(cudaMemcpy(optNet->csrVal[l], h_csrVal, total_nnz * sizeof(float), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(optNet->csrColInd[l], h_csrColInd, total_nnz * sizeof(int), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(optNet->csrRowPtr[l], h_csrRowPtr, (live_neurons + 1) * sizeof(int), cudaMemcpyHostToDevice));
-
-            CUSPARSE_CHECK(cusparseCreateCsr(&optNet->matDescr[l], live_neurons, orig_in, total_nnz,
-                                             optNet->csrRowPtr[l], optNet->csrColInd[l], optNet->csrVal[l],
-                                             CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
-            free(h_csrVal); free(h_csrColInd); free(h_csrRowPtr);
-        }
-
-        free(h_W); free(h_b); free(h_compactW); free(h_compactB); free(live_indices);
     }
-    cusparseDestroy(spHandle);
+
+    int new_in;
+    if (prev_live_indices != NULL){
+        new_in = prev_live_neurons;
+    } else {
+        new_in = orig_in;
+    }
+
+    optNet->in_dims[l] = new_in;
+    optNet->out_dims[l] = live_neurons;
+    optNet->nnz[l] = total_nnz;
+
+    int c;
+    float* h_compactW = (float*)malloc(new_in * live_neurons * sizeof(float));
+    float* h_compactB = (float*)malloc(live_neurons * sizeof(float));
+
+    for (int r_idx = 0; r_idx < live_neurons; r_idx++) {
+        int r = live_indices[r_idx];
+        h_compactB[r_idx] = h_b[r];
+        for (int c_idx = 0; c_idx < new_in; c_idx++) {
+            if (prev_live_indices != NULL) {
+                c= prev_live_indices[c_idx];
+            } else {
+                c = c_idx;
+            }
+            h_compactW[c_idx * live_neurons + r_idx] = h_W[c * orig_out + r];
+        }
+    }
+
+    CUDA_CHECK(cudaMalloc(&optNet->bias[l], live_neurons * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(optNet->bias[l], h_compactB, live_neurons * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&optNet->denseW[l], new_in * live_neurons * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(optNet->denseW[l], h_compactW, new_in * live_neurons * sizeof(float), cudaMemcpyHostToDevice));
+
+    free(h_W); free(h_b); free(h_compactW); free(h_compactB);
+
+    *out_live_indices = live_indices;
+    *out_live_neurons = live_neurons;
+
+    return live_neurons;
 }
 
-void post_processing(NN* network, float threshold, float dense_cutoff, PostProcessedNN* optNet, Gates gate){
+void post_processing(NN* network, float threshold, PostProcessedNN* optNet, Gates gate){
     float *g_tmp;
+    int* nnzs;
+    int* h_nnzs;
+
+    int live_in = network->layers[0];
+    int prev_live_neurons = 0;
+    int* prev_live_indices = NULL;
+
     for (int l =0; l < NUM_LAYERS; l++){
+        int orig_out = network->layers[l+1];
 
         // Keep nnz, non-pruned
-        int* nnzs;
+        h_nnzs = (int*)malloc(sizeof(int)*network->layers[l+1]);
         cudaMalloc(&nnzs, sizeof(int)*network->layers[l+1]);
 
         if (gate == GATES){
@@ -640,14 +590,28 @@ void post_processing(NN* network, float threshold, float dense_cutoff, PostProce
         }
 
         pruning<<<network->layers[l+1], 256, 256 * (sizeof(float) + sizeof(int))>>>(
-            network->weights[l], g_tmp, nnzs, threshold, network->layers[l+1], network->layers[l]);
+            network->weights[l], g_tmp, nnzs, threshold, orig_out, live_in);
+
+        cudaMemcpy(h_nnzs, nnzs, sizeof(int)*network->layers[l+1], cudaMemcpyDeviceToHost);
+
+        int* next_live_indices = NULL;
+        int  next_live_neurons = 0;
+
+        live_in = convert_to_optimized_2(optNet, live_in, orig_out, network->weights[l], network->bias[l], h_nnzs, prev_live_indices, prev_live_neurons, l, &next_live_indices, &next_live_neurons);
+
+        free(prev_live_indices);
+
+        prev_live_indices = next_live_indices;
+        prev_live_neurons = next_live_neurons;
+
 
         cudaFree(nnzs);
+        free(h_nnzs);
     }
-    convert_to_optimized(network, optNet, dense_cutoff);
+    free(prev_live_indices);
 }
 
-void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buffers, cublasHandle_t cbHandle, cusparseHandle_t spHandle) {
+void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buffers, cublasHandle_t cbHandle) {
     float one = 1.0f, zero = 0.0f;
     float* in;
 
@@ -659,26 +623,10 @@ void optimized_forward(PostProcessedNN* optNet, float* d_input, float** act_buff
         }
         float* out = act_buffers[l];
 
-        if (optNet->type[l] == LAYER_DENSE) {
-            CUBLAS_CHECK(cublasSgemm(cbHandle, CUBLAS_OP_N, CUBLAS_OP_N,
-                                     optNet->out_dims[l], BATCH_SIZE, optNet->in_dims[l],
-                                     &one, optNet->denseW[l], optNet->out_dims[l],
-                                     in, optNet->in_dims[l], &zero, out, optNet->out_dims[l]));
-        } else {
-            cusparseDnMatDescr_t matIn, matOut;
-            cusparseCreateDnMat(&matIn, optNet->in_dims[l], BATCH_SIZE, optNet->in_dims[l], in, CUDA_R_32F, CUSPARSE_ORDER_COL);
-            cusparseCreateDnMat(&matOut, optNet->out_dims[l], BATCH_SIZE, optNet->out_dims[l], out, CUDA_R_32F, CUSPARSE_ORDER_COL);
-
-            size_t bufSize = 0;
-            cusparseSpMM_bufferSize(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                    &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &bufSize);
-            void* d_buf; cudaMalloc(&d_buf, bufSize);
-            cusparseSpMM(spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                         &one, optNet->matDescr[l], matIn, &zero, matOut, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, d_buf);
-
-            cudaFree(d_buf);
-            cusparseDestroyDnMat(matIn); cusparseDestroyDnMat(matOut);
-        }
+        CUBLAS_CHECK(cublasSgemm(cbHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                    optNet->out_dims[l], BATCH_SIZE, optNet->in_dims[l],
+                                    &one, optNet->denseW[l], optNet->out_dims[l],
+                                    in, optNet->in_dims[l], &zero, out, optNet->out_dims[l]));
 
         dim3 block(16, 16), grid((optNet->out_dims[l] + 15)/16, (BATCH_SIZE + 15)/16);
         add_bias<<<grid, block>>>(out, optNet->bias[l], optNet->out_dims[l], BATCH_SIZE);
@@ -785,8 +733,6 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     int batches_per_iter = image_count/BATCH_SIZE;
     int correct_pred_count = 0;
 
-    cusparseHandle_t spHandle;
-    cusparseCreate(&spHandle);
     float* opt_act_buffers[NUM_LAYERS];
     for (int l = 0; l < NUM_LAYERS; l++) {
         CUDA_CHECK(cudaMalloc(&opt_act_buffers[l], BATCH_SIZE * network->out_dims[l] * sizeof(float)));
@@ -797,7 +743,7 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
 
         cudaMemcpy(d_images, &images[(IMAGE_LENGTH*IMAGE_LENGTH*offset)], IMAGE_LENGTH*IMAGE_LENGTH*BATCH_SIZE*sizeof(float), cudaMemcpyHostToDevice);
 
-        optimized_forward(network, d_images, opt_act_buffers, handle, spHandle);
+        optimized_forward(network, d_images, opt_act_buffers, handle);
 
         float* h_outputs = (float*)malloc(BATCH_SIZE * network->out_dims[NUM_LAYERS-1] * sizeof(float));
 
@@ -833,7 +779,6 @@ float test_nn(PostProcessedNN* network, cublasHandle_t handle){
     for (int l = 0; l < NUM_LAYERS; l++) {
         CUDA_CHECK(cudaFree(opt_act_buffers[l]));
     }
-    cusparseDestroy(spHandle);
 
     return percentage;
 }
@@ -913,7 +858,7 @@ void training_round(float decay, Gates gate, float threshold, float lamb, float 
 
         PostProcessedNN optNet;
 
-        post_processing(&network, threshold, 0.3, &optNet, gate);
+        post_processing(&network, threshold, &optNet, gate);
 
         gettimeofday(&start, NULL);
 
@@ -956,17 +901,17 @@ void training_round(float decay, Gates gate, float threshold, float lamb, float 
 }
 
 int main() {
-    static const float STEP_SIZES[] = {0.025f, 0.05f, 0.075f};
-    static const float THRESHOLDS[] = {0.1f, 0.5f, 0.0f};
-    static const float DECAY[] = {0.0f, 0.001f, 0.01f};
-    static const float REGULARIZATION[] = {0.2f, 0.15f, 0.25f};
+    static const float STEP_SIZES[] = {0.025f};
+    static const float THRESHOLDS[] = {0.25f, 0.0f};
+    static const float DECAY[] = {0.01f, 0.0f};
+    static const float REGULARIZATION[] = {0.2f};
     static const int INTERNAL_SIZES[] = {128, 256, 512};
     static const char* MODE_NAMES[] = {"GATES","NO GATES"};
-    for(int i=0; i<3; i++){
+    for(int i=0; i<1; i++){
         for(int j=0; j<3; j++){
-            for(int k=0; k<3; j++){
-                for(int l=0; l<3; l++){
-                    for (int m=0; m<3; m++){
+            for(int k=0; k<2; k++){
+                for(int l=0; l<2; l++){
+                    for (int m=0; m<1; m++){
                         printf("\nSTEP SIZE: %.3f INTERNAL SIZE: %d\n", STEP_SIZES[i], INTERNAL_SIZES[j]);
                         // printf("====GATES NO====\n");
                         training_round(DECAY[l], GATES, THRESHOLDS[k], REGULARIZATION[m], STEP_SIZES[i], INTERNAL_SIZES[j], MODE_NAMES[0]);
