@@ -78,7 +78,17 @@ __global__ void relu_kernel(float* pre_act,
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch){
         int index = col*out_dim+row;
-        post_act[index] = fmaxf(0.0f, pre_act[index]);
+        int inner_idx = threadIdx.x + blockDim.x * threadIdx.y;
+        __shared__ float sh_pre_act[256];
+        if (inner_idx %4 ==0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&sh_pre_act[inner_idx]) = *reinterpret_cast<float4*>(&pre_act[index]);
+        }
+        __syncthreads();
+        sh_pre_act[inner_idx] = fmaxf(0.0f, sh_pre_act[inner_idx]);
+        __syncthreads();
+        if (inner_idx %4 ==0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&post_act[index]) = *reinterpret_cast<float4*>(&sh_pre_act[inner_idx]);
+        }
     }
 }
 
@@ -121,27 +131,64 @@ __global__ void add_bias(float* data, float* bias, int out_dim, int batch){
 __global__ void g_regularization(float* params, float* g_grad, float* weights, float norm, float LR, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
-        float final_g = g_grad[tid] * weights[tid];
-        params[tid] -= LR*(final_g+norm);
-        if (params[tid] < 0){
-            params[tid] = 0;
+        int inner_idx = threadIdx.x;
+        __shared__ float sh_g_grad[256];
+        __shared__ float sh_weights[256];
+        __shared__ float sh_params[256];
+        if (inner_idx % 4 ==0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&sh_g_grad[inner_idx]) = *reinterpret_cast<float4*>(&g_grad[tid]);
+            *reinterpret_cast<float4*>(&sh_weights[inner_idx]) = *reinterpret_cast<float4*>(&weights[tid]);
+            *reinterpret_cast<float4*>(&sh_params[inner_idx]) = *reinterpret_cast<float4*>(&params[tid]);
         }
-        if (params[tid] >1){
-            params[tid] = 1;
+        __syncthreads();
+
+        sh_params[inner_idx] -= LR*((sh_g_grad[inner_idx] * sh_weights[inner_idx])+norm);
+        if (sh_params[inner_idx] < 0){
+            sh_params[inner_idx] = 0;
+        }
+        if (sh_params[inner_idx] >1){
+            sh_params[inner_idx] = 1;
+        }
+        __syncthreads();
+        if (inner_idx % 4 ==0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&params[tid]) = *reinterpret_cast<float4*>(&sh_params[inner_idx]);
         }
     }
 }
 
+
+// TOOD Optimize
 // Sum up the preactivations to update the biases
 __global__ void bias_grad_kernel(float* pre_act, float* bias, int out_dim, int batch){
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim) return;
+    extern __shared__ float s_data[];
 
-    float acc = 0.0f;
-    for (int col = 0; col < batch; col++){
-        acc += pre_act[col * out_dim + row];
-    }
-    bias[row] = acc;
+        int row = blockIdx.x * blockDim.x + threadIdx.x;
+        int tid_x = threadIdx.x;
+        int tid_y = threadIdx.y;
+        int b_dim_x = blockDim.x;
+        int b_dim_y = blockDim.y;
+
+        float acc = 0.0f;
+
+        if (row < out_dim) {
+            for (int c = tid_y; c < batch; c += b_dim_y) {
+                acc += pre_act[c * out_dim + row];
+            }
+        }
+
+        s_data[tid_y * b_dim_x + tid_x] = acc;
+        __syncthreads();
+
+        for (int stride = b_dim_y / 2; stride > 0; stride >>= 1) {
+            if (tid_y < stride) {
+                s_data[tid_y * b_dim_x + tid_x] += s_data[(tid_y + stride) * b_dim_x + tid_x];
+            }
+            __syncthreads();
+        }
+
+        if (tid_y == 0 && row < out_dim) {
+            bias[row] = s_data[tid_x];
+        }
 }
 
 // Backwards kernel on softmax. Essentially, it is the difference between the predicted probability and where or not it is the actual label
@@ -151,6 +198,8 @@ __global__ void softmax_backwards_kernel(float* prob_out, int* labels, float* pr
     if (row < out_dim && col < batch){
         int tid = col * out_dim + row;
         float correct_pred;
+
+
         if (labels[col] == row){
             correct_pred = 1.0f;
         } else {
@@ -178,6 +227,8 @@ __global__ void pruning(float* weights, float* g, int* total_nnzs, float thresho
     float thread_sum =0;
     int nnzs = 0;
 
+    // While vectorized loads could be used, each element is only used once, and there is enough staggering of loading
+    // That we have chosen not to.
     for (int i = tid; i < inputs; i += blockDim.x){
         if ((g != NULL && g[neuron + i * neurons] < 0.5) || (weights[neuron + i * neurons] < 1e-4f && weights[neuron + i * neurons] > -1e-4f)){
             weights[neuron + i * neurons] = 0;
@@ -224,8 +275,8 @@ __global__ void pruning(float* weights, float* g, int* total_nnzs, float thresho
 }
 
 // Gradient is identity if relu is active and 0 if it is not.
-__global__ void relu_backward_kernel(const float* grad_out,
-                                     const float* pre_act,
+__global__ void relu_backward_kernel(float* grad_out,
+                                    float* pre_act,
                                      float* grad_in,
                                      int out_dim, int batch)
 {
@@ -233,10 +284,23 @@ __global__ void relu_backward_kernel(const float* grad_out,
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < out_dim && col < batch) {
         int idx = col * out_dim + row;
-        if (pre_act[idx] > 0.0f){
-            grad_in[idx] = grad_out[idx];
-        } else{
-            grad_in[idx] = 0.0f;
+        int inner_idx = threadIdx.x + blockDim.x * threadIdx.y;
+
+        __shared__ float sh_pre_act[256];
+        __shared__ float sh_grad_out[256];
+
+        if (inner_idx % 4 == 0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&sh_pre_act[inner_idx]) = *reinterpret_cast<float4*>(&pre_act[idx]);
+            *reinterpret_cast<float4*>(&sh_grad_out[inner_idx]) = *reinterpret_cast<float4*>(&grad_out[idx]);
+        }
+        __syncthreads();
+
+        if (sh_pre_act[inner_idx] <= 0.0f){
+            sh_grad_out[inner_idx] = 0.0f;
+        }
+        __syncthreads();
+        if (inner_idx % 4 == 0 && inner_idx < 256){
+            *reinterpret_cast<float4*>(&grad_in[idx]) = *reinterpret_cast<float4*>(&sh_grad_out[inner_idx]);
         }
     }
 }
@@ -245,16 +309,17 @@ __global__ void relu_backward_kernel(const float* grad_out,
 __global__ void sgd_kernel(float* params, float* grad, float LR, int n, float decay){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
-        params[tid] = (1-LR*decay)*params[tid] - (LR * grad[tid]);
-    }
-}
-
-// At the end of training, if our gate's ML draw is inactive, disable it.
-__global__ void remove_gates(float* weights, float* g, int n){
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < n){
-        if (g[tid] < 0.5){
-            weights[tid] = 0;
+        __shared__ float sh_params[256];
+        __shared__ float sh_grad[256];
+        if (threadIdx.x % 4 == 0 && threadIdx.x < 256){
+            *reinterpret_cast<float4*>(&sh_grad[threadIdx.x]) = *reinterpret_cast<float4*>(&grad[tid]);
+            *reinterpret_cast<float4*>(&sh_params[threadIdx.x]) = *reinterpret_cast<float4*>(&params[tid]);
+        }
+        __syncthreads();
+        sh_params[threadIdx.x] = (1-LR*decay)*sh_params[threadIdx.x] - (LR * sh_grad[threadIdx.x]);
+        __syncthreads();
+        if (threadIdx.x % 4 == 0 && threadIdx.x < 256){
+            *reinterpret_cast<float4*>(&params[tid]) = *reinterpret_cast<float4*>(&sh_params[threadIdx.x]);
         }
     }
 }
@@ -277,8 +342,19 @@ __global__ void gate_mult(float* weights, float* g, float* post_g, int in, int o
 __global__ void mask_w_grad(float* w_grad, float* g, int n){
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n){
-        if (g[tid] < 0.5){
-            w_grad[tid] = 0;
+        __shared__ float sh_g[256];
+        __shared__ float sh_w_grad[256];
+        if (threadIdx.x % 4 == 0 && threadIdx.x < 256){
+            *reinterpret_cast<float4*>(&sh_g[threadIdx.x]) = *reinterpret_cast<float4*>(&g[tid]);
+            *reinterpret_cast<float4*>(&sh_w_grad[threadIdx.x]) = *reinterpret_cast<float4*>(&w_grad[tid]);
+        }
+        __syncthreads();
+        if (sh_g[threadIdx.x] < 0.5){
+            sh_w_grad[threadIdx.x] = 0;
+        }
+        __syncthreads();
+        if (threadIdx.x % 4 == 0 && threadIdx.x < 256){
+            *reinterpret_cast<float4*>(&w_grad[tid]) = *reinterpret_cast<float4*>(&sh_w_grad[threadIdx.x]);
         }
     }
 }
@@ -464,9 +540,9 @@ void backward(NN* network, float* input, int* labels, cublasHandle_t handle, flo
         }
 
         // Sum over the batch of pre-gradients to get the bias gradient
-        dim3 b_grad_block(256);
-        dim3 b_grad_grid((network->layers[l+1] + 255) / 256);
-        bias_grad_kernel<<<b_grad_grid, b_grad_block>>>(
+        dim3 b_grad_block(32,8);
+        dim3 b_grad_grid((network->layers[l+1] + 31) /32);
+        bias_grad_kernel<<<b_grad_grid, b_grad_block, b_grad_block.x * b_grad_block.y * sizeof(float)>>>(
                 network->pre_grad[l], network->b_grad[l], network->layers[l+1], BATCH_SIZE);
 
         if (l > 0){
@@ -904,8 +980,8 @@ int main() {
     static const float STEP_SIZES[] = {0.025f};
     static const float THRESHOLDS[] = {0.25f, 0.0f};
     static const float DECAY[] = {0.01f, 0.0f};
-    static const float REGULARIZATION[] = {0.2f};
-    static const int INTERNAL_SIZES[] = {128, 256, 512};
+    static const float REGULARIZATION[] = {0.21f};
+    static const int INTERNAL_SIZES[] = {512};
     static const char* MODE_NAMES[] = {"GATES","NO GATES"};
     for(int i=0; i<1; i++){
         for(int j=0; j<3; j++){
