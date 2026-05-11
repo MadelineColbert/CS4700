@@ -183,7 +183,7 @@ def plot(data):
                 "Training Time", "ms", "training_time.png")
 
     plot_metric(data, nnz, positions, colors, legend,
-                "Sparsity", "NNZ %", "sparsity.png")
+                "Density", "NNZ %", "density.png")
 
 
 if __name__ == "__main__":
