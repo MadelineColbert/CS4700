@@ -36,6 +36,9 @@ def total_weights(h):
 
 
 def nnz_percentage(d):
+    if d["internal_size"] <= 0:
+        return 100.0
+
     return (d["nnzs"] / total_weights(d["internal_size"])) * 100.0
 
 
@@ -70,6 +73,16 @@ def make_colors(data):
     legend_map = {}
 
     for d in data:
+
+        if d["mode"] == "CPU":
+            color = "black"
+            colors.append(color)
+
+            if ("CPU",) not in legend_map:
+                legend_map[("CPU",)] = color
+
+            continue
+
         mode, pruned, decay = config_key(d)
         factor = shade_factor(pruned, decay)
 
@@ -84,12 +97,20 @@ def make_colors(data):
         colors.append(color)
 
         key = (mode_label, pruned, decay)
+
         if key not in legend_map:
             legend_map[key] = color
 
     legend = []
 
-    for (mode_label, pruned, decay), color in legend_map.items():
+    for key, color in legend_map.items():
+
+        if key == ("CPU",):
+            legend.append(Patch(color=color, label="CPU Baseline"))
+            continue
+
+        mode_label, pruned, decay = key
+
         parts = [mode_label]
         parts.append("Pruned" if pruned else "NoPrune")
         parts.append("Decay" if decay else "NoDecay")
@@ -101,11 +122,18 @@ def make_colors(data):
     return colors, legend
 
 
+def group_order(data):
+    return sorted(
+        set(d["internal_size"] for d in data),
+        key=lambda x: 999999 if x == -1 else x
+    )
+
+
 def make_positions(data, gap=2):
     positions = []
     x = 0
 
-    for h in sorted(set(d["internal_size"] for d in data)):
+    for h in group_order(data):
         group = [d for d in data if d["internal_size"] == h]
 
         for _ in group:
@@ -118,14 +146,17 @@ def make_positions(data, gap=2):
 
 
 def draw_groups(data, positions):
-    for h in sorted(set(d["internal_size"] for d in data)):
+    for h in group_order(data):
         idx = [i for i, d in enumerate(data) if d["internal_size"] == h]
+
         xs = [positions[i] for i in idx]
+
+        label = "CPU Baseline" if h == -1 else f"{h} Hidden"
 
         plt.text(
             sum(xs) / len(xs),
             -0.05,
-            f"{h} Hidden",
+            label,
             ha="center",
             va="top",
             transform=plt.gca().get_xaxis_transform(),
@@ -134,7 +165,15 @@ def draw_groups(data, positions):
         )
 
 
-def plot_metric(data, values, positions, colors, legend, title, ylabel, filename):
+def plot_metric(data,
+                values,
+                positions,
+                colors,
+                legend,
+                title,
+                ylabel,
+                filename):
+
     plt.figure(figsize=(22, 8))
 
     plt.bar(positions, values, color=colors)
@@ -159,11 +198,18 @@ def plot_metric(data, values, positions, colors, legend, title, ylabel, filename
     plt.close()
 
 
+def sort_key(d):
+    if d["internal_size"] == -1:
+        return (999999, d["mode"])
+
+    return (d["internal_size"], d["mode"])
+
+
 def plot(data):
     if not data:
         return
 
-    data = sorted(data, key=lambda d: (d["internal_size"], d["mode"]))
+    data = sorted(data, key=sort_key)
 
     colors, legend = make_colors(data)
     positions = make_positions(data)
@@ -171,19 +217,58 @@ def plot(data):
     acc = [d["accuracy"] for d in data]
     t = [d["time"] for d in data]
     tt = [d["test_time"] for d in data]
-    nnz = [nnz_percentage(d) for d in data]
 
-    plot_metric(data, acc, positions, colors, legend,
-                "Accuracy", "Acc (%)", "accuracy.png")
+    nnz = []
 
-    plot_metric(data, tt, positions, colors, legend,
-                "Inference Time", "ms", "inference_time.png")
+    for d in data:
+        if d["mode"] == "CPU":
+            nnz.append(100.0)
+        else:
+            nnz.append(nnz_percentage(d))
 
-    plot_metric(data, t, positions, colors, legend,
-                "Training Time", "ms", "training_time.png")
+    plot_metric(
+        data,
+        acc,
+        positions,
+        colors,
+        legend,
+        "Accuracy",
+        "Acc (%)",
+        "accuracy.png"
+    )
 
-    plot_metric(data, nnz, positions, colors, legend,
-                "Density", "NNZ %", "density.png")
+    plot_metric(
+        data,
+        tt,
+        positions,
+        colors,
+        legend,
+        "Inference Time",
+        "ms",
+        "inference_time.png"
+    )
+
+    plot_metric(
+        data,
+        t,
+        positions,
+        colors,
+        legend,
+        "Training Time",
+        "ms",
+        "training_time.png"
+    )
+
+    plot_metric(
+        data,
+        nnz,
+        positions,
+        colors,
+        legend,
+        "Density",
+        "NNZ %",
+        "density.png"
+    )
 
 
 if __name__ == "__main__":
