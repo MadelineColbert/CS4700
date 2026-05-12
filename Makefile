@@ -12,22 +12,28 @@ mnist:
 	wget --no-check-certificate https://raw.githubusercontent.com/fgnt/mnist/master/train-labels-idx1-ubyte.gz
 	wget --no-check-certificate https://raw.githubusercontent.com/fgnt/mnist/master/t10k-images-idx3-ubyte.gz
 	wget --no-check-certificate https://raw.githubusercontent.com/fgnt/mnist/master/t10k-labels-idx1-ubyte.gz
-	gunzip train-images-idx3-ubyte.gz
-	gunzip train-labels-idx1-ubyte.gz
-	gunzip t10k-images-idx3-ubyte.gz
-	gunzip t10k-labels-idx1-ubyte.gz
+	gunzip -f train-images-idx3-ubyte.gz
+	gunzip -f train-labels-idx1-ubyte.gz
+	gunzip -f t10k-images-idx3-ubyte.gz
+	gunzip -f t10k-labels-idx1-ubyte.gz
+
+
+# -------------------------
+# CPU build (densecpu.cpp)
+# -------------------------
 
 EIGEN_VERSION = 3.4.0
 EIGEN_DIR     = eigen
 EIGEN_URL     = https://gitlab.com/libeigen/eigen/-/archive/$(EIGEN_VERSION)/eigen-$(EIGEN_VERSION).tar.gz
 
-DENSE_SRC     = dense/densecpu.cpp
-DENSE_TARGET  = dense/densecpu
-CXX           = g++
-CXXFLAGS      = -std=c++11 -I$(EIGEN_DIR) -O2
+SRC       = densecpu.cpp
+TARGET_CPU = densecpu
+
+CXX       = g++
+CXXFLAGS  = -std=c++11 -I$(EIGEN_DIR) -O2
 
 densecpu: $(EIGEN_DIR)
-	$(CXX) $(CXXFLAGS) -o $(DENSE_TARGET) $(DENSE_SRC)
+	$(CXX) $(CXXFLAGS) -o $(TARGET_CPU) $(SRC)
 
 $(EIGEN_DIR):
 	@echo "Downloading Eigen $(EIGEN_VERSION)..."
@@ -40,5 +46,5 @@ $(EIGEN_DIR):
 	fi
 	@echo "Eigen ready."
 
-run-densecpu:
-	cd dense && ./densecpu
+run-cpu:
+	./densecpu
