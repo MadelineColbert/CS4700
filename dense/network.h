@@ -4,7 +4,7 @@
 #include <vector>
 #include <iostream>
 #include <cstdlib>
-#include <eigen3/Eigen/Dense>
+#include <Eigen/Dense>
 
 #define NUM_LAYERS 4
 
