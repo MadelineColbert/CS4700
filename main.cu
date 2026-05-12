@@ -968,7 +968,7 @@ void training_round(float decay, Gates gate, float threshold, float lamb, float 
     }
     float average_accuracy = accuracy_sum / ITERATIONS;
     double average_time = time_sum/ITERATIONS;
-    log_result(lr, INTERNAL_LAYER_SIZE, mode_name, average_accuracy, average_time, nnzs/3, test_time_sum, threshold, decay, lamb);
+    log_result(lr, INTERNAL_LAYER_SIZE, mode_name, average_accuracy, average_time, nnzs/ITERATIONS, test_time_sum, threshold, decay, lamb);
     printf("Average Accuracy: %.2f%%\n", average_accuracy);
     printf("Average Time: %.3f ms\n", average_time);
     free(accuracies);
