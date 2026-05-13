@@ -28,7 +28,6 @@
     } while (0)
 
 #define NUM_LAYERS 4
-
 #define BATCH_SIZE 256
 #define EPOCHS 100
 #define IMAGE_LENGTH 28
@@ -981,7 +980,7 @@ int main() {
     static const float THRESHOLDS[] = {0.25f, 0.0f};
     static const float DECAY[] = {0.01f, 0.0f};
     static const float REGULARIZATION[] = {0.21f};
-    static const int INTERNAL_SIZES[] = {512};
+    static const int INTERNAL_SIZES[] = {128, 256, 512};
     static const char* MODE_NAMES[] = {"GATES","NO GATES"};
     for(int i=0; i<1; i++){
         for(int j=0; j<3; j++){

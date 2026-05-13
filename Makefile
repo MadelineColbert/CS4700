@@ -17,11 +17,6 @@ mnist:
 	gunzip -f t10k-images-idx3-ubyte.gz
 	gunzip -f t10k-labels-idx1-ubyte.gz
 
-
-# -------------------------
-# CPU build (densecpu.cpp)
-# -------------------------
-
 EIGEN_VERSION = 3.4.0
 EIGEN_DIR     = eigen
 EIGEN_URL     = https://gitlab.com/libeigen/eigen/-/archive/$(EIGEN_VERSION)/eigen-$(EIGEN_VERSION).tar.gz

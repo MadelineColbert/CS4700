@@ -29,6 +29,12 @@ void load_mnist(const char* image_file, const char* label_file,
                 float** images, int** labels, int* count) {
     FILE* ifp = fopen(image_file, "rb");
     FILE* lfp = fopen(label_file, "rb");
+
+    if (!ifp || !lfp) {
+        printf("Failed to open MNIST files:\n%s\n%s\n",
+            image_file, label_file);
+        exit(1);
+    }
     char tmp[4];
 
     fread(tmp, 1, 4, ifp);
@@ -96,8 +102,8 @@ float test_nn(Network* neuralNet) {
     int* labels = NULL;
     int count = 0;
 
-    load_mnist("t10k-images.idx3-ubyte",
-               "t10k-labels.idx1-ubyte",
+    load_mnist("t10k-images-idx3-ubyte",
+               "t10k-labels-idx1-ubyte",
                &images,
                &labels,
                &count);
@@ -168,8 +174,8 @@ int main() {
         int* labels = NULL;
         int count = 0;
 
-        load_mnist("train-images.idx3-ubyte",
-                   "train-labels.idx1-ubyte",
+        load_mnist("train-images-idx3-ubyte",
+                   "train-labels-idx1-ubyte",
                    &images,
                    &labels,
                    &count);
@@ -216,8 +222,8 @@ int main() {
         int* test_labels = NULL;
         int test_count = 0;
 
-        load_mnist("t10k-images.idx3-ubyte",
-                   "t10k-labels.idx1-ubyte",
+        load_mnist("t10k-images-idx3-ubyte",
+                   "t10k-labels-idx1-ubyte",
                    &test_images,
                    &test_labels,
                    &test_count);
