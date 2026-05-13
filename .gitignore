@@ -2,3 +2,5 @@ build/
 test
 *-ubyte
 *.png
+eigen/
+densecpu
